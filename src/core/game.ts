@@ -170,6 +170,26 @@ interface Decoration {
   variant: number;
 }
 
+// ─── World render order (A3) ─────────────────────────────────────
+// Everything that stands on the ground is painted back-to-front by its own
+// Y coordinate so a unit behind a tower is correctly occluded by it.
+
+const WorldKind = {
+  Decoration: 0,
+  Tower: 1,
+  Soldier: 2,
+  Enemy: 3,
+  Gate: 4,
+  Castle: 5,
+} as const;
+type WorldKind = (typeof WorldKind)[keyof typeof WorldKind];
+
+interface WorldItem {
+  y: number;
+  kind: WorldKind;
+  ref: unknown;
+}
+
 export class Game {
   private renderer: Renderer;
   private input: InputManager;
@@ -219,6 +239,10 @@ export class Game {
 
   // Map decorations
   private decorations: Decoration[] = [];
+
+  // Depth-sorted world pass (A3), reused every frame to avoid allocations.
+  private worldItems: WorldItem[] = [];
+  private worldOrder: number[] = [];
 
   // World map
   private worldMapHovered = -1;
@@ -2164,29 +2188,10 @@ export class Game {
     // Background
     r.drawBackground(level.id, level.path);
 
-    // Decorations (behind path)
-    for (const dec of this.decorations) {
-      switch (dec.type) {
-        case 'tree': r.drawTree(dec.x, dec.y, dec.size, level.id, dec.variant); break;
-        case 'rock': r.drawRock(dec.x, dec.y, dec.size, level.id, dec.variant); break;
-        case 'bush': r.drawBush(dec.x, dec.y, dec.size, level.id, dec.variant); break;
-        case 'mushroom': r.drawMushroom(dec.x, dec.y, dec.size, level.id); break;
-        case 'stump': r.drawStump(dec.x, dec.y, dec.size, level.id); break;
-        case 'bones': r.drawBones(dec.x, dec.y, dec.size); break;
-        case 'sign': r.drawSign(dec.x, dec.y, dec.size, level.id); break;
-      }
-    }
-
-    // Path
+    // Path (flat ground layer)
     r.drawPath(level.path, level.id);
 
-    // Spawn gate
-    r.drawSpawnGate(level.spawnPosition);
-
-    // Base/Castle
-    r.drawBase(level.basePosition);
-
-    // Build slots
+    // Build slots are ground decals: they always sit under the sorted pass.
     for (let i = 0; i < level.buildSlots.length; i++) {
       const slot = level.buildSlots[i];
       const occupied = this.towers.some(t => t.slotIndex === i);
@@ -2195,27 +2200,49 @@ export class Game {
       r.drawBuildSlot(slot.x, slot.y, occupied, hovered, selected);
     }
 
-    // Range circle for selected tower
+    // Range circle for selected tower (ground decal).
     if (this.selectedTower) {
       const stats = this.getTowerStats(this.selectedTower);
       r.drawRangeCircle(this.selectedTower.x, this.selectedTower.y, stats.range);
     }
 
-    // Towers
-    for (const tower of this.towers) {
-      this.renderTower(tower);
-    }
-
-    // Soldiers (Barracks & Reinforcements)
+    // A3: everything standing on the ground is painted back-to-front by its
+    // own Y, so units behind a tower are correctly hidden by it.
+    let n = 0;
+    n = this.addWorldItem(n, level.spawnPosition.y, WorldKind.Gate, null);
+    n = this.addWorldItem(n, level.basePosition.y, WorldKind.Castle, null);
+    for (const dec of this.decorations) n = this.addWorldItem(n, dec.y, WorldKind.Decoration, dec);
+    for (const tower of this.towers) n = this.addWorldItem(n, tower.y, WorldKind.Tower, tower);
     for (const soldier of this.soldiers) {
-      if (!soldier.alive) continue;
-      this.drawInterpolated(soldier, (view) => drawSoldierDirect(ctx, view, this.menuTime));
+      if (soldier.alive) n = this.addWorldItem(n, soldier.y, WorldKind.Soldier, soldier);
     }
-
-    // Enemies
     for (const enemy of this.enemies) {
-      if (!enemy.alive) continue;
-      this.drawInterpolated(enemy, (view) => this.renderEnemy(view));
+      if (enemy.alive) n = this.addWorldItem(n, enemy.y, WorldKind.Enemy, enemy);
+    }
+    this.sortWorldItems(n);
+
+    for (let i = 0; i < n; i++) {
+      const item = this.worldItems[this.worldOrder[i]];
+      switch (item.kind) {
+        case WorldKind.Decoration:
+          this.drawDecoration(item.ref as Decoration, level.id);
+          break;
+        case WorldKind.Tower:
+          this.renderTower(item.ref as Tower);
+          break;
+        case WorldKind.Soldier:
+          this.drawInterpolated(item.ref as Soldier, (view) => drawSoldierDirect(ctx, view, this.menuTime));
+          break;
+        case WorldKind.Enemy:
+          this.drawInterpolated(item.ref as Enemy, (view) => this.renderEnemy(view));
+          break;
+        case WorldKind.Gate:
+          r.drawSpawnGate(level.spawnPosition);
+          break;
+        case WorldKind.Castle:
+          r.drawBase(level.basePosition);
+          break;
+      }
     }
 
     // Meteors (Rain of Fire)
@@ -2275,6 +2302,41 @@ export class Game {
       r.drawTextWithShadow('PAUSED', DESIGN_WIDTH / 2, DESIGN_HEIGHT / 2 - 10, '#ffd866', 48, 'center', 'MedievalSharp');
       // The match is genuinely frozen now: only the pause button or Esc resumes.
       r.drawText('Press Esc or click the pause button to resume', DESIGN_WIDTH / 2, DESIGN_HEIGHT / 2 + 40, 'rgba(255,255,255,0.7)', 16);
+    }
+  }
+
+  // ─── Depth-sorted world pass (A3) ──────────────────────────────
+
+  private addWorldItem(index: number, y: number, kind: WorldKind, ref: unknown): number {
+    let item = this.worldItems[index];
+    if (!item) {
+      item = { y: 0, kind: WorldKind.Decoration, ref: null };
+      this.worldItems[index] = item;
+    }
+    item.y = y;
+    item.kind = kind;
+    item.ref = ref;
+    return index + 1;
+  }
+
+  private sortWorldItems(count: number): void {
+    const order = this.worldOrder;
+    order.length = 0;
+    for (let i = 0; i < count; i++) order.push(i);
+    const items = this.worldItems;
+    order.sort((a, b) => items[a].y - items[b].y);
+  }
+
+  private drawDecoration(dec: Decoration, levelId: string): void {
+    const r = this.renderer;
+    switch (dec.type) {
+      case 'tree': r.drawTree(dec.x, dec.y, dec.size, levelId, dec.variant); break;
+      case 'rock': r.drawRock(dec.x, dec.y, dec.size, levelId, dec.variant); break;
+      case 'bush': r.drawBush(dec.x, dec.y, dec.size, levelId, dec.variant); break;
+      case 'mushroom': r.drawMushroom(dec.x, dec.y, dec.size, levelId); break;
+      case 'stump': r.drawStump(dec.x, dec.y, dec.size, levelId); break;
+      case 'bones': r.drawBones(dec.x, dec.y, dec.size); break;
+      case 'sign': r.drawSign(dec.x, dec.y, dec.size, levelId); break;
     }
   }
 

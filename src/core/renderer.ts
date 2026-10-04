@@ -3,6 +3,7 @@
 
 import { Vec2, DESIGN_WIDTH, DESIGN_HEIGHT } from '../data/types';
 import { updateViewport, getViewport, SAFE_AREA } from './viewport';
+import { sprites } from '../rendering/SpriteBank';
 import {
   drawBackgroundDirect,
   drawPathDirect,
@@ -46,6 +47,10 @@ export class Renderer {
     this.canvas.style.width = `${cssW}px`;
     this.canvas.style.height = `${cssH}px`;
 
+    // Keep baked sprites at least as sharp as the display after scaling.
+    const needed = vp.scale * vp.dpr;
+    sprites.setSupersample(needed >= 1.6 ? 3 : 2);
+
     this.applyWorldTransform();
   }
 
@@ -81,6 +86,9 @@ export class Renderer {
     ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
 
     this.applyWorldTransform();
+    // High-quality downscaling for baked sprites.
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
     ctx.fillStyle = '#0a0a12';
     ctx.fillRect(0, 0, DESIGN_WIDTH, DESIGN_HEIGHT);
   }

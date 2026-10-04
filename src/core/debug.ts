@@ -4,6 +4,7 @@
 // they must be measured, never estimated.
 
 import { DESIGN_HEIGHT } from '../data/types';
+import { sprites } from '../rendering/SpriteBank';
 
 const SAMPLE_COUNT = 120;
 
@@ -94,11 +95,12 @@ export class DebugOverlay {
   draw(ctx: CanvasRenderingContext2D): void {
     if (!this.enabled) return;
 
+    const spriteStats = sprites.stats();
     const lines = [
       `fps ${this.fps.toFixed(0)}  frame p50 ${this.frameP50.toFixed(2)}ms  p95 ${this.frameP95.toFixed(2)}ms`,
       `enemies ${this.latest.enemies}  entities ${this.latest.entities} (peak ${this.peaks.entities})`,
       `particles ${this.latest.particles} (peak ${this.peaks.particles})  projectiles ${this.latest.projectiles}`,
-      `sprite bakes ${this.latest.spriteBakes}  cache hits ${this.latest.spriteCacheHits}`,
+      `sprites ${spriteStats.entries} cached  bakes ${spriteStats.bakes}  hits ${spriteStats.hits}  ss×${spriteStats.supersample}`,
       'F1 toggle debug',
     ];
 
