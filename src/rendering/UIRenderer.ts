@@ -4,7 +4,6 @@
 // Fully procedural with zero external image assets.
 
 import { LevelData, SaveData, Vec2, DESIGN_WIDTH, DESIGN_HEIGHT } from '../data/types';
-import { ThreeRenderer } from './ThreeRenderer';
 
 // Offscreen cache for the high-detail parchment map terrain
 let cachedMapCanvas: HTMLCanvasElement | null = null;

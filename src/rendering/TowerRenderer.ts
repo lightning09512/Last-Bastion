@@ -2,9 +2,8 @@
 // Procedural tower drawing with detailed architecture for each type/level
 // Replaces simple rectangles with Kingdom Rush-style isometric buildings
 
-import * as THREE from 'three';
-import { ThreeRenderer } from './ThreeRenderer';
 import { TOWERS } from '../data/towers';
+import { lighten, darken } from '../core/color';
 
 interface TowerRenderData {
   x: number;
@@ -15,67 +14,6 @@ interface TowerRenderData {
   animTimer: number;
   stunTimer: number;
   id: number;
-}
-
-export function renderTower(
-  renderer: ThreeRenderer,
-  tower: TowerRenderData,
-): void {
-  const towerData = TOWERS[tower.dataId];
-  if (!towerData) return;
-  
-  const size = 56 + tower.level * 4 + (tower.specId ? 8 : 0);
-  
-  const texture = renderer.generateProceduralTexture(
-    size, size + 20,
-    (ctx, w, h) => {
-      ctx.clearRect(0, 0, w, h);
-      const cx = w / 2;
-      const cy = h * 0.65;
-      const baseColor = towerData.color;
-      const animScale = tower.animTimer > 0 ? 1 + tower.animTimer * 0.5 : 1;
-      
-      ctx.save();
-      ctx.translate(cx, cy);
-      ctx.scale(animScale, animScale);
-      ctx.translate(-cx, -cy);
-      
-      // Shadow
-      ctx.fillStyle = 'rgba(0,0,0,0.2)';
-      ctx.beginPath();
-      ctx.ellipse(cx, cy + 10, 18, 8, 0, 0, Math.PI * 2);
-      ctx.fill();
-      
-      switch (tower.dataId) {
-        case 'archer':
-          drawArcherTower(ctx, cx, cy, tower.level, tower.specId, baseColor);
-          break;
-        case 'mage':
-          drawMageTower(ctx, cx, cy, tower.level, tower.specId, baseColor);
-          break;
-        case 'cannon':
-          drawCannonTower(ctx, cx, cy, tower.level, tower.specId, baseColor);
-          break;
-        case 'barracks':
-          drawBarracksTower(ctx, cx, cy, tower.level, tower.specId, baseColor);
-          break;
-        default:
-          drawGenericTower(ctx, cx, cy, tower.level, baseColor);
-      }
-      
-      // Stun effect
-      if (tower.stunTimer > 0) {
-        ctx.fillStyle = 'rgba(255,255,100,0.4)';
-        ctx.font = '14px sans-serif';
-        ctx.textAlign = 'center';
-        ctx.fillText('⚡', cx, cy - 20);
-      }
-      
-      ctx.restore();
-    },
-  );
-  
-  renderer.createSprite(texture, tower.x, tower.y - 10, size, size + 20, renderer.towerTopLayer);
 }
 
 // ─── Archer Tower ───────────────────────────────────────────────
@@ -260,7 +198,7 @@ function drawMageTower(ctx: CanvasRenderingContext2D, cx: number, cy: number, le
     ctx.lineTo(cx + 12, cy - h + 8);
     ctx.closePath();
     ctx.fill();
-    ctx.fillStyle = ThreeRenderer.lighten(color, 0.15);
+    ctx.fillStyle = lighten(color, 0.15);
     ctx.beginPath();
     ctx.moveTo(cx - 8, cy - h + 7);
     ctx.lineTo(cx, cy - h);
@@ -398,7 +336,7 @@ function drawMageFigure(ctx: CanvasRenderingContext2D, x: number, y: number, col
   ctx.arc(x, y - 3.5 * s, 2 * s, 0, Math.PI * 2);
   ctx.fill();
   // Hat
-  ctx.fillStyle = ThreeRenderer.darken(color, 0.2);
+  ctx.fillStyle = darken(color, 0.2);
   ctx.beginPath();
   ctx.moveTo(x - 3 * s, y - 3 * s);
   ctx.lineTo(x, y - 8 * s);
@@ -427,7 +365,7 @@ function drawCrystal(ctx: CanvasRenderingContext2D, x: number, y: number, size: 
   ctx.fill();
   
   // Highlight
-  ctx.fillStyle = ThreeRenderer.lighten(color, 0.4);
+  ctx.fillStyle = lighten(color, 0.4);
   ctx.beginPath();
   ctx.moveTo(x - size * 0.2, y - size * 0.6);
   ctx.lineTo(x, y - size);
@@ -584,7 +522,7 @@ function drawBarracksTower(ctx: CanvasRenderingContext2D, cx: number, cy: number
     ctx.fill();
     
     // Tent highlight
-    ctx.fillStyle = ThreeRenderer.lighten(color, 0.15);
+    ctx.fillStyle = lighten(color, 0.15);
     ctx.beginPath();
     ctx.moveTo(cx, cy - h);
     ctx.lineTo(cx + 10, cy + 1);
@@ -593,7 +531,7 @@ function drawBarracksTower(ctx: CanvasRenderingContext2D, cx: number, cy: number
     ctx.fill();
     
     // Opening
-    ctx.fillStyle = ThreeRenderer.darken(color, 0.3);
+    ctx.fillStyle = darken(color, 0.3);
     ctx.beginPath();
     ctx.moveTo(cx - 4, cy + 2);
     ctx.lineTo(cx, cy - 4);
@@ -729,7 +667,7 @@ function drawSoldierFigure(ctx: CanvasRenderingContext2D, x: number, y: number, 
   ctx.lineTo(x + 3 * s, y + 4 * s);
   ctx.stroke();
   // Shield
-  ctx.fillStyle = ThreeRenderer.darken(color, 0.2);
+  ctx.fillStyle = darken(color, 0.2);
   ctx.fillRect(x - 4 * s, y - 1 * s, 2 * s, 4 * s);
 }
 
@@ -792,7 +730,7 @@ function drawGenericTower(ctx: CanvasRenderingContext2D, cx: number, cy: number,
   const h = 20 + level * 6;
   ctx.fillStyle = color;
   ctx.fillRect(cx - 10, cy - h, 20, h);
-  ctx.fillStyle = ThreeRenderer.lighten(color, 0.15);
+  ctx.fillStyle = lighten(color, 0.15);
   ctx.fillRect(cx - 8, cy - h + 2, 8, h - 4);
   drawLevelDots(ctx, cx, cy + 6, level, null);
 }
@@ -828,79 +766,6 @@ function drawStarShape(ctx: CanvasRenderingContext2D, cx: number, cy: number, r:
   ctx.closePath();
   ctx.fill();
 }
-
-// ─── Build Slot ─────────────────────────────────────────────────
-
-export function renderBuildSlot(
-  renderer: ThreeRenderer,
-  x: number, y: number,
-  occupied: boolean,
-  hovered: boolean,
-  selected: boolean,
-): void {
-  if (occupied) return; // Tower renders on top
-  
-  const texture = renderer.generateProceduralTexture(48, 32, (ctx, w, h) => {
-    ctx.clearRect(0, 0, w, h);
-    const cx = w / 2;
-    const cy = h / 2;
-    
-    // Shadow
-    ctx.fillStyle = 'rgba(0,0,0,0.18)';
-    ctx.beginPath();
-    ctx.ellipse(cx, cy + 4, 20, 12, 0, 0, Math.PI * 2);
-    ctx.fill();
-    
-    // Stone platform
-    ctx.fillStyle = hovered ? '#e8d5a0' : '#c9a96e';
-    ctx.beginPath();
-    ctx.ellipse(cx, cy, 18, 11, 0, 0, Math.PI * 2);
-    ctx.fill();
-    
-    // Raised center
-    ctx.fillStyle = hovered ? '#f0e0b0' : '#d4b880';
-    ctx.beginPath();
-    ctx.ellipse(cx, cy - 1, 14, 8, 0, 0, Math.PI * 2);
-    ctx.fill();
-    
-    // Stone edge details
-    ctx.strokeStyle = selected ? '#ffd700' : (hovered ? '#fff' : 'rgba(90,60,30,0.5)');
-    ctx.lineWidth = selected ? 2.5 : 1.5;
-    ctx.beginPath();
-    ctx.ellipse(cx, cy, 18, 11, 0, 0, Math.PI * 2);
-    ctx.stroke();
-    
-    // Small rocks on edge
-    ctx.fillStyle = 'rgba(120,100,60,0.3)';
-    for (let i = 0; i < 6; i++) {
-      const a = (i / 6) * Math.PI * 2;
-      const rx = cx + Math.cos(a) * 16;
-      const ry = cy + Math.sin(a) * 9;
-      ctx.beginPath();
-      ctx.arc(rx, ry, 2, 0, Math.PI * 2);
-      ctx.fill();
-    }
-    
-    // "+" icon
-    ctx.fillStyle = hovered ? '#5c4033' : 'rgba(90,60,30,0.5)';
-    ctx.font = 'bold 16px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText('+', cx, cy - 1);
-    
-    // Hover glow
-    if (hovered) {
-      ctx.fillStyle = 'rgba(255,220,100,0.15)';
-      ctx.beginPath();
-      ctx.ellipse(cx, cy, 22, 14, 0, 0, Math.PI * 2);
-      ctx.fill();
-    }
-  });
-  
-    renderer.createSprite(texture, x, y, 48, 32, renderer.buildSlotLayer);
-}
-
-// ─── Direct Canvas2D Rendering ───────────────────────────────────
 
 export function drawTowerDirect(
   ctx: CanvasRenderingContext2D,

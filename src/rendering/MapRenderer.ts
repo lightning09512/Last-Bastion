@@ -1,10 +1,9 @@
 // ─── Map Renderer ────────────────────────────────────────────────
 // Procedural terrain, path, and decoration rendering for Kingdom Rush quality
-// Uses Three.js with canvas-generated textures for rich visual detail
+// Canvas 2D drawing with generated textures for rich visual detail
 
-import * as THREE from 'three';
-import { ThreeRenderer } from './ThreeRenderer';
 import { Vec2, DESIGN_WIDTH, DESIGN_HEIGHT } from '../data/types';
+import { lighten, darken } from '../core/color';
 
 // ─── Noise function (simplex-like for terrain) ──────────────────
 function hash(x: number, y: number): number {
@@ -153,402 +152,6 @@ export function getTheme(levelId: string): LevelTheme {
   return LEVEL_THEMES[levelId] || LEVEL_THEMES.level_1;
 }
 
-// ─── Terrain Generation ─────────────────────────────────────────
-
-export function generateTerrain(
-  renderer: ThreeRenderer,
-  levelId: string,
-  path: Vec2[],
-): void {
-  const theme = getTheme(levelId);
-  
-  const texture = renderer.generateProceduralTexture(
-    DESIGN_WIDTH, DESIGN_HEIGHT,
-    (ctx, w, h) => {
-      // Base grass gradient
-      const baseGrad = ctx.createLinearGradient(0, 0, 0, h);
-      baseGrad.addColorStop(0, theme.grassHighlight);
-      baseGrad.addColorStop(0.4, theme.grassBase);
-      baseGrad.addColorStop(0.7, theme.grassDark);
-      baseGrad.addColorStop(1, theme.grassBase);
-      ctx.fillStyle = baseGrad;
-      ctx.fillRect(0, 0, w, h);
-      
-      // Procedural noise texture overlay for natural grass
-      const imgData = ctx.getImageData(0, 0, w, h);
-      const data = imgData.data;
-      for (let py = 0; py < h; py++) {
-        for (let px = 0; px < w; px++) {
-          const i = (py * w + px) * 4;
-          const noise = fbm(px * 0.02, py * 0.02, 4);
-          const detail = fbm(px * 0.08, py * 0.08, 2);
-          
-          // Grass variation
-          const variation = (noise - 0.5) * 30 + (detail - 0.5) * 15;
-          data[i] = Math.max(0, Math.min(255, data[i] + variation));
-          data[i + 1] = Math.max(0, Math.min(255, data[i + 1] + variation * 1.2));
-          data[i + 2] = Math.max(0, Math.min(255, data[i + 2] + variation * 0.3));
-          
-          // Darken near path (dirt blend)
-          let minPathDist = Infinity;
-          for (let j = 0; j < path.length - 1; j++) {
-            const d = pointToSegDist(px, py, path[j].x, path[j].y, path[j + 1].x, path[j + 1].y);
-            minPathDist = Math.min(minPathDist, d);
-          }
-          
-          if (minPathDist < 50) {
-            const blend = Math.max(0, 1 - minPathDist / 50);
-            const dirtR = parseInt(theme.pathDark.slice(1, 3), 16);
-            const dirtG = parseInt(theme.pathDark.slice(3, 5), 16);
-            const dirtB = parseInt(theme.pathDark.slice(5, 7), 16);
-            data[i] = Math.round(data[i] * (1 - blend * 0.3) + dirtR * blend * 0.3);
-            data[i + 1] = Math.round(data[i + 1] * (1 - blend * 0.3) + dirtG * blend * 0.3);
-            data[i + 2] = Math.round(data[i + 2] * (1 - blend * 0.3) + dirtB * blend * 0.3);
-          }
-        }
-      }
-      ctx.putImageData(imgData, 0, 0);
-      
-      // Grass tufts
-      for (let i = 0; i < 600; i++) {
-        const gx = Math.random() * w;
-        const gy = Math.random() * h;
-        
-        // Skip near path
-        let nearPath = false;
-        for (let j = 0; j < path.length - 1; j++) {
-          if (pointToSegDist(gx, gy, path[j].x, path[j].y, path[j+1].x, path[j+1].y) < 30) {
-            nearPath = true;
-            break;
-          }
-        }
-        if (nearPath) continue;
-        
-        const grassHeight = 3 + Math.random() * 6;
-        const grassColor = Math.random() > 0.5 ? theme.grassHighlight : theme.grassDark;
-        ctx.strokeStyle = grassColor;
-        ctx.lineWidth = 1;
-        ctx.globalAlpha = 0.4 + Math.random() * 0.3;
-        
-        for (let b = 0; b < 3; b++) {
-          const angle = -Math.PI / 2 + (Math.random() - 0.5) * 0.8;
-          ctx.beginPath();
-          ctx.moveTo(gx + b * 2, gy);
-          ctx.lineTo(gx + b * 2 + Math.cos(angle) * grassHeight, gy + Math.sin(angle) * grassHeight);
-          ctx.stroke();
-        }
-      }
-      ctx.globalAlpha = 1;
-      
-      // Subtle flowers / ground details
-      for (let i = 0; i < 80; i++) {
-        const fx = Math.random() * w;
-        const fy = Math.random() * h;
-        
-        let nearPath = false;
-        for (let j = 0; j < path.length - 1; j++) {
-          if (pointToSegDist(fx, fy, path[j].x, path[j].y, path[j+1].x, path[j+1].y) < 35) {
-            nearPath = true;
-            break;
-          }
-        }
-        if (nearPath) continue;
-        
-        const flowerColor = theme.flowerColors[Math.floor(Math.random() * theme.flowerColors.length)];
-        ctx.fillStyle = flowerColor;
-        ctx.globalAlpha = 0.4 + Math.random() * 0.3;
-        ctx.beginPath();
-        ctx.arc(fx, fy, 1.5 + Math.random() * 1.5, 0, Math.PI * 2);
-        ctx.fill();
-        // Petals
-        if (Math.random() > 0.5) {
-          for (let p = 0; p < 4; p++) {
-            const pa = (p / 4) * Math.PI * 2;
-            ctx.beginPath();
-            ctx.arc(fx + Math.cos(pa) * 2, fy + Math.sin(pa) * 2, 1, 0, Math.PI * 2);
-            ctx.fill();
-          }
-        }
-      }
-      ctx.globalAlpha = 1;
-      
-      // Edge darkening (vignette on terrain)
-      const vignetteGrad = ctx.createRadialGradient(w / 2, h / 2, h * 0.35, w / 2, h / 2, w * 0.75);
-      vignetteGrad.addColorStop(0, 'rgba(0,0,0,0)');
-      vignetteGrad.addColorStop(1, 'rgba(0,0,0,0.25)');
-      ctx.fillStyle = vignetteGrad;
-      ctx.fillRect(0, 0, w, h);
-    },
-    `terrain_${levelId}`,
-  );
-  
-  const geo = new THREE.PlaneGeometry(DESIGN_WIDTH, DESIGN_HEIGHT);
-  const mat = new THREE.MeshBasicMaterial({
-    map: texture,
-    depthTest: false,
-    depthWrite: false,
-  });
-  const mesh = new THREE.Mesh(geo, mat);
-  mesh.position.set(DESIGN_WIDTH / 2, DESIGN_HEIGHT / 2, 0);
-  renderer.terrainLayer.add(mesh);
-}
-
-// ─── Path Rendering ─────────────────────────────────────────────
-
-export function generatePath(
-  renderer: ThreeRenderer,
-  levelId: string,
-  waypoints: Vec2[],
-): void {
-  if (waypoints.length < 2) return;
-  const theme = getTheme(levelId);
-  
-  const texture = renderer.generateProceduralTexture(
-    DESIGN_WIDTH, DESIGN_HEIGHT,
-    (ctx, w, h) => {
-      ctx.clearRect(0, 0, w, h);
-      
-      // Helper to draw the path shape
-      const drawPathStroke = (width: number, color: string, dash?: number[]) => {
-        ctx.strokeStyle = color;
-        ctx.lineWidth = width;
-        ctx.lineCap = 'round';
-        ctx.lineJoin = 'round';
-        if (dash) ctx.setLineDash(dash);
-        else ctx.setLineDash([]);
-        
-        ctx.beginPath();
-        ctx.moveTo(waypoints[0].x, waypoints[0].y);
-        
-        // Use bezier curves for smoother path
-        for (let i = 1; i < waypoints.length; i++) {
-          const prev = waypoints[i - 1];
-          const curr = waypoints[i];
-          const midX = (prev.x + curr.x) / 2;
-          const midY = (prev.y + curr.y) / 2;
-          
-          if (i === 1) {
-            ctx.lineTo(midX, midY);
-          } else {
-            const prevMidX = (waypoints[i - 2].x + prev.x) / 2;
-            const prevMidY = (waypoints[i - 2].y + prev.y) / 2;
-            ctx.quadraticCurveTo(prev.x, prev.y, midX, midY);
-          }
-        }
-        const last = waypoints[waypoints.length - 1];
-        ctx.lineTo(last.x, last.y);
-        ctx.stroke();
-      };
-      
-      // Path shadow (outer)
-      drawPathStroke(48, 'rgba(0,0,0,0.2)');
-      
-      // Path edge (dark dirt)
-      drawPathStroke(42, theme.pathDark);
-      
-      // Main path body
-      drawPathStroke(36, theme.pathBase);
-      
-      // Center highlight
-      drawPathStroke(18, theme.pathLight);
-      
-      // Edge detail (stones/pebbles pattern)
-      drawPathStroke(40, 'rgba(0,0,0,0.08)', [3, 6]);
-      
-      // Wagon tracks
-      ctx.globalAlpha = 0.08;
-      drawPathStroke(2, '#3a2a1a');
-      ctx.globalAlpha = 1;
-      
-      // Scattered pebbles along the path
-      for (let i = 0; i < waypoints.length - 1; i++) {
-        const p1 = waypoints[i];
-        const p2 = waypoints[i + 1];
-        const segLen = Math.sqrt((p2.x - p1.x) ** 2 + (p2.y - p1.y) ** 2);
-        const pebbleCount = Math.floor(segLen / 8);
-        
-        for (let j = 0; j < pebbleCount; j++) {
-          const t = Math.random();
-          const px = p1.x + (p2.x - p1.x) * t + (Math.random() - 0.5) * 30;
-          const py = p1.y + (p2.y - p1.y) * t + (Math.random() - 0.5) * 30;
-          
-          ctx.fillStyle = Math.random() > 0.5 ? theme.pathDark : theme.pathLight;
-          ctx.globalAlpha = 0.15 + Math.random() * 0.15;
-          ctx.beginPath();
-          ctx.ellipse(px, py, 1 + Math.random() * 2, 1 + Math.random(), Math.random() * Math.PI, 0, Math.PI * 2);
-          ctx.fill();
-        }
-      }
-      ctx.globalAlpha = 1;
-      
-      // Grass tufts along path edges
-      for (let i = 0; i < waypoints.length - 1; i++) {
-        const p1 = waypoints[i];
-        const p2 = waypoints[i + 1];
-        const dx = p2.x - p1.x;
-        const dy = p2.y - p1.y;
-        const len = Math.sqrt(dx * dx + dy * dy);
-        const nx = -dy / len;
-        const ny = dx / len;
-        
-        const tuftsCount = Math.floor(len / 6);
-        for (let j = 0; j < tuftsCount; j++) {
-          const t = j / tuftsCount;
-          const baseX = p1.x + dx * t;
-          const baseY = p1.y + dy * t;
-          
-          // Both sides
-          for (const side of [-1, 1]) {
-            const offset = 18 + Math.random() * 6;
-            const gx = baseX + nx * side * offset;
-            const gy = baseY + ny * side * offset;
-            
-            ctx.strokeStyle = theme.grassBase;
-            ctx.lineWidth = 1;
-            ctx.globalAlpha = 0.3 + Math.random() * 0.3;
-            
-            for (let b = 0; b < 2; b++) {
-              const bladeAngle = -Math.PI / 2 + (Math.random() - 0.5) * 1.0 + side * 0.3;
-              const bladeLen = 3 + Math.random() * 4;
-              ctx.beginPath();
-              ctx.moveTo(gx + b * 2, gy);
-              ctx.lineTo(gx + b * 2 + Math.cos(bladeAngle) * bladeLen, gy + Math.sin(bladeAngle) * bladeLen);
-              ctx.stroke();
-            }
-          }
-        }
-      }
-      ctx.globalAlpha = 1;
-    },
-    `path_${levelId}`,
-  );
-  
-  const geo = new THREE.PlaneGeometry(DESIGN_WIDTH, DESIGN_HEIGHT);
-  const mat = new THREE.MeshBasicMaterial({
-    map: texture,
-    transparent: true,
-    depthTest: false,
-    depthWrite: false,
-  });
-  const mesh = new THREE.Mesh(geo, mat);
-  mesh.position.set(DESIGN_WIDTH / 2, DESIGN_HEIGHT / 2, 0);
-  renderer.pathLayer.add(mesh);
-}
-
-// ─── Decorations ────────────────────────────────────────────────
-
-export interface DecorationData {
-  x: number;
-  y: number;
-  type: 'tree' | 'rock' | 'bush' | 'mushroom' | 'stump' | 'bones' | 'sign';
-  size: number;
-  variant: number;
-}
-
-export function generateDecorations(
-  path: Vec2[],
-  buildSlots: Vec2[],
-  levelId: string,
-): DecorationData[] {
-  const decorations: DecorationData[] = [];
-  const types: DecorationData['type'][] = ['tree', 'tree', 'tree', 'rock', 'bush', 'bush', 'mushroom', 'stump'];
-  
-  // Add level-specific decorations
-  if (levelId === 'level_4' || levelId === 'level_5') {
-    types.push('bones', 'bones');
-  }
-  if (levelId === 'level_3') {
-    types.push('sign');
-  }
-  
-  for (let i = 0; i < 50; i++) {
-    let x: number, y: number;
-    let valid = false;
-    let attempts = 0;
-    
-    do {
-      x = 30 + Math.random() * (DESIGN_WIDTH - 60);
-      y = 40 + Math.random() * (DESIGN_HEIGHT - 120);
-      valid = true;
-      
-      for (const wp of path) {
-        const dx = x - wp.x;
-        const dy = y - wp.y;
-        if (Math.sqrt(dx * dx + dy * dy) < 55) { valid = false; break; }
-      }
-      if (valid) {
-        for (const s of buildSlots) {
-          const dx = x - s.x;
-          const dy = y - s.y;
-          if (Math.sqrt(dx * dx + dy * dy) < 45) { valid = false; break; }
-        }
-      }
-      if (valid) {
-        for (const d of decorations) {
-          const dx = x - d.x;
-          const dy = y - d.y;
-          if (Math.sqrt(dx * dx + dy * dy) < 25) { valid = false; break; }
-        }
-      }
-      attempts++;
-    } while (!valid && attempts < 30);
-    
-    if (valid) {
-      decorations.push({
-        x, y,
-        type: types[Math.floor(Math.random() * types.length)],
-        size: 8 + Math.random() * 16,
-        variant: Math.floor(Math.random() * 4),
-      });
-    }
-  }
-  
-  return decorations;
-}
-
-export function renderDecoration(
-  renderer: ThreeRenderer,
-  dec: DecorationData,
-  theme: LevelTheme,
-  time: number,
-): void {
-  const texture = renderer.generateProceduralTexture(
-    64, 80,
-    (ctx, w, h) => {
-      ctx.clearRect(0, 0, w, h);
-      const cx = w / 2;
-      const cy = h * 0.7;
-      const s = dec.size;
-      
-      switch (dec.type) {
-        case 'tree':
-          drawTree(ctx, cx, cy, s, dec.variant, theme, time);
-          break;
-        case 'rock':
-          drawRock(ctx, cx, cy, s, dec.variant, theme);
-          break;
-        case 'bush':
-          drawBush(ctx, cx, cy, s, dec.variant, theme);
-          break;
-        case 'mushroom':
-          drawMushroom(ctx, cx, cy, s, theme);
-          break;
-        case 'stump':
-          drawStump(ctx, cx, cy, s, theme);
-          break;
-        case 'bones':
-          drawBones(ctx, cx, cy, s);
-          break;
-        case 'sign':
-          drawSign(ctx, cx, cy, s, theme);
-          break;
-      }
-    },
-  );
-  
-  renderer.createSprite(texture, dec.x, dec.y, 64, 80, renderer.decorationLayer);
-}
-
 // ─── Decoration Drawing Functions ───────────────────────────────
 
 function drawTree(ctx: CanvasRenderingContext2D, cx: number, cy: number, s: number, variant: number, theme: LevelTheme, _time: number): void {
@@ -565,11 +168,11 @@ function drawTree(ctx: CanvasRenderingContext2D, cx: number, cy: number, s: numb
   ctx.fillRect(cx - trunkW, cy - trunkH, trunkW * 2, trunkH + s * 0.1);
   
   // Trunk texture
-  ctx.fillStyle = ThreeRenderer.lighten(theme.treeTrunk, 0.1);
+  ctx.fillStyle = lighten(theme.treeTrunk, 0.1);
   ctx.fillRect(cx - trunkW * 0.5, cy - trunkH + 2, trunkW * 0.6, trunkH - 4);
   
   // Bark details
-  ctx.strokeStyle = ThreeRenderer.darken(theme.treeTrunk, 0.15);
+  ctx.strokeStyle = darken(theme.treeTrunk, 0.15);
   ctx.lineWidth = 0.5;
   for (let i = 0; i < 4; i++) {
     const by = cy - trunkH + i * (trunkH / 4) + 3;
@@ -616,7 +219,7 @@ function drawTree(ctx: CanvasRenderingContext2D, cx: number, cy: number, s: numb
     ctx.fill();
     
     // Leaf highlight
-    ctx.fillStyle = ThreeRenderer.lighten(color, 0.12);
+    ctx.fillStyle = lighten(color, 0.12);
     ctx.beginPath();
     ctx.arc(cx + l.ox * s - l.r * s * 0.2, cy + l.oy * s - l.r * s * 0.2, l.r * s * 0.5, 0, Math.PI * 2);
     ctx.fill();
@@ -743,13 +346,13 @@ function drawStump(ctx: CanvasRenderingContext2D, cx: number, cy: number, s: num
   ctx.fillRect(cx - s * 0.15, cy - s * 0.15, s * 0.3, s * 0.25);
   
   // Top (ring pattern)
-  ctx.fillStyle = ThreeRenderer.lighten(theme.treeTrunk, 0.15);
+  ctx.fillStyle = lighten(theme.treeTrunk, 0.15);
   ctx.beginPath();
   ctx.ellipse(cx, cy - s * 0.15, s * 0.15, s * 0.08, 0, 0, Math.PI * 2);
   ctx.fill();
   
   // Growth rings
-  ctx.strokeStyle = ThreeRenderer.darken(theme.treeTrunk, 0.1);
+  ctx.strokeStyle = darken(theme.treeTrunk, 0.1);
   ctx.lineWidth = 0.5;
   ctx.beginPath();
   ctx.ellipse(cx, cy - s * 0.15, s * 0.08, s * 0.04, 0, 0, Math.PI * 2);
@@ -794,11 +397,11 @@ function drawSign(ctx: CanvasRenderingContext2D, cx: number, cy: number, s: numb
   ctx.fillRect(cx - 1.5, cy - s * 0.4, 3, s * 0.5);
   
   // Sign board
-  ctx.fillStyle = ThreeRenderer.lighten(theme.treeTrunk, 0.2);
+  ctx.fillStyle = lighten(theme.treeTrunk, 0.2);
   ctx.fillRect(cx - s * 0.25, cy - s * 0.4, s * 0.5, s * 0.2);
   
   // Border
-  ctx.strokeStyle = ThreeRenderer.darken(theme.treeTrunk, 0.15);
+  ctx.strokeStyle = darken(theme.treeTrunk, 0.15);
   ctx.lineWidth = 1;
   ctx.strokeRect(cx - s * 0.25, cy - s * 0.4, s * 0.5, s * 0.2);
   
@@ -808,229 +411,6 @@ function drawSign(ctx: CanvasRenderingContext2D, cx: number, cy: number, s: numb
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.fillText('⚠', cx, cy - s * 0.3);
-}
-
-// ─── Spawn Gate ─────────────────────────────────────────────────
-
-export function renderSpawnGate(
-  renderer: ThreeRenderer,
-  pos: Vec2,
-  theme: LevelTheme,
-): void {
-  const texture = renderer.generateProceduralTexture(80, 80, (ctx, w, h) => {
-    ctx.clearRect(0, 0, w, h);
-    const cx = w / 2;
-    const cy = h / 2;
-    
-    // Gate shadow
-    ctx.fillStyle = 'rgba(0,0,0,0.25)';
-    ctx.fillRect(cx - 24, cy - 18 + 5, 48, 42);
-    
-    // Stone pillars
-    ctx.fillStyle = '#5a5050';
-    ctx.fillRect(cx - 26, cy - 24, 12, 48);
-    ctx.fillRect(cx + 14, cy - 24, 12, 48);
-    
-    // Pillar highlights
-    ctx.fillStyle = '#7a7070';
-    ctx.fillRect(cx - 24, cy - 22, 6, 44);
-    ctx.fillRect(cx + 16, cy - 22, 6, 44);
-    
-    // Top beam
-    ctx.fillStyle = '#5a5050';
-    ctx.fillRect(cx - 28, cy - 28, 56, 10);
-    ctx.fillStyle = '#7a7070';
-    ctx.fillRect(cx - 26, cy - 26, 52, 5);
-    
-    // Gate arch
-    ctx.fillStyle = '#1a0a0a';
-    ctx.beginPath();
-    ctx.arc(cx, cy + 2, 13, Math.PI, 0);
-    ctx.fill();
-    ctx.fillRect(cx - 13, cy + 2, 26, 18);
-    
-    // Gate glow (ominous)
-    ctx.fillStyle = 'rgba(180,60,30,0.3)';
-    ctx.beginPath();
-    ctx.arc(cx, cy + 8, 10, 0, Math.PI * 2);
-    ctx.fill();
-    
-    // Skull decoration on top
-    ctx.fillStyle = '#d8d0c0';
-    ctx.beginPath();
-    ctx.arc(cx, cy - 18, 6, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = '#2a1a1a';
-    ctx.beginPath();
-    ctx.arc(cx - 2.5, cy - 19, 1.5, 0, Math.PI * 2);
-    ctx.arc(cx + 2.5, cy - 19, 1.5, 0, Math.PI * 2);
-    ctx.fill();
-    // Teeth
-    ctx.fillStyle = '#d8d0c0';
-    ctx.fillRect(cx - 3, cy - 15, 6, 2);
-    ctx.strokeStyle = '#2a1a1a';
-    ctx.lineWidth = 0.5;
-    for (let i = 0; i < 4; i++) {
-      ctx.beginPath();
-      ctx.moveTo(cx - 2.5 + i * 1.7, cy - 15);
-      ctx.lineTo(cx - 2.5 + i * 1.7, cy - 13);
-      ctx.stroke();
-    }
-    
-    // Torches on pillars
-    for (const side of [-1, 1]) {
-      const tx = cx + side * 20;
-      const ty = cy - 12;
-      // Torch holder
-      ctx.fillStyle = '#4a3020';
-      ctx.fillRect(tx - 1.5, ty, 3, 8);
-      // Flame
-      ctx.fillStyle = '#ff8800';
-      ctx.beginPath();
-      ctx.arc(tx, ty, 4, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.fillStyle = '#ffcc00';
-      ctx.beginPath();
-      ctx.arc(tx, ty - 1, 2, 0, Math.PI * 2);
-      ctx.fill();
-    }
-  });
-  
-  renderer.createSprite(texture, pos.x, pos.y, 80, 80, renderer.decorationLayer);
-}
-
-// ─── Castle Base ────────────────────────────────────────────────
-
-export function renderBase(
-  renderer: ThreeRenderer,
-  pos: Vec2,
-  theme: LevelTheme,
-): void {
-  const texture = renderer.generateProceduralTexture(100, 100, (ctx, w, h) => {
-    ctx.clearRect(0, 0, w, h);
-    const cx = w / 2;
-    const cy = h / 2 + 5;
-    
-    // Castle shadow
-    ctx.fillStyle = 'rgba(0,0,0,0.25)';
-    ctx.beginPath();
-    ctx.ellipse(cx, cy + 28, 40, 14, 0, 0, Math.PI * 2);
-    ctx.fill();
-    
-    // Castle base (stone)
-    ctx.fillStyle = '#8B7355';
-    ctx.fillRect(cx - 32, cy - 24, 64, 52);
-    
-    // Castle walls (lighter stone)
-    ctx.fillStyle = '#a89070';
-    ctx.fillRect(cx - 28, cy - 20, 56, 44);
-    
-    // Stone texture
-    ctx.strokeStyle = 'rgba(0,0,0,0.08)';
-    ctx.lineWidth = 0.5;
-    for (let row = 0; row < 6; row++) {
-      const ry = cy - 18 + row * 7;
-      ctx.beginPath();
-      ctx.moveTo(cx - 26, ry);
-      ctx.lineTo(cx + 26, ry);
-      ctx.stroke();
-      // Vertical brick lines (offset each row)
-      const offset = row % 2 === 0 ? 0 : 7;
-      for (let col = 0; col < 5; col++) {
-        ctx.beginPath();
-        ctx.moveTo(cx - 26 + offset + col * 14, ry);
-        ctx.lineTo(cx - 26 + offset + col * 14, ry + 7);
-        ctx.stroke();
-      }
-    }
-    
-    // Battlements (crenellations)
-    ctx.fillStyle = '#8B7355';
-    for (let i = 0; i < 6; i++) {
-      const bx = cx - 30 + i * 12;
-      ctx.fillRect(bx, cy - 32, 8, 14);
-      // Highlight
-      ctx.fillStyle = '#9a8468';
-      ctx.fillRect(bx + 1, cy - 30, 4, 10);
-      ctx.fillStyle = '#8B7355';
-    }
-    
-    // Gate
-    ctx.fillStyle = '#4a3020';
-    ctx.beginPath();
-    ctx.arc(cx, cy + 6, 11, Math.PI, 0);
-    ctx.fill();
-    ctx.fillRect(cx - 11, cy + 6, 22, 18);
-    
-    // Gate detail (metal strips)
-    ctx.strokeStyle = '#3a2010';
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    ctx.moveTo(cx - 8, cy + 6);
-    ctx.lineTo(cx - 8, cy + 22);
-    ctx.moveTo(cx + 8, cy + 6);
-    ctx.lineTo(cx + 8, cy + 22);
-    ctx.moveTo(cx - 11, cy + 14);
-    ctx.lineTo(cx + 11, cy + 14);
-    ctx.stroke();
-    
-    // Banner
-    ctx.fillStyle = '#c41e3a';
-    ctx.fillRect(cx - 5, cy - 42, 10, 16);
-    // Banner emblem
-    ctx.fillStyle = '#ffd700';
-    ctx.beginPath();
-    // Star/shield shape
-    ctx.moveTo(cx, cy - 38);
-    ctx.lineTo(cx + 3, cy - 34);
-    ctx.lineTo(cx, cy - 30);
-    ctx.lineTo(cx - 3, cy - 34);
-    ctx.closePath();
-    ctx.fill();
-    
-    // Flag pole
-    ctx.strokeStyle = '#4a3020';
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.moveTo(cx, cy - 46);
-    ctx.lineTo(cx, cy - 24);
-    ctx.stroke();
-    
-    // Flag tip
-    ctx.fillStyle = '#ffd700';
-    ctx.beginPath();
-    ctx.arc(cx, cy - 46, 2, 0, Math.PI * 2);
-    ctx.fill();
-    
-    // Tower turrets (left and right)
-    for (const side of [-1, 1]) {
-      const tx = cx + side * 28;
-      ctx.fillStyle = '#7a6348';
-      ctx.fillRect(tx - 6, cy - 28, 12, 28);
-      ctx.fillStyle = '#8a7358';
-      ctx.fillRect(tx - 4, cy - 26, 8, 24);
-      // Mini battlements
-      ctx.fillStyle = '#7a6348';
-      ctx.fillRect(tx - 7, cy - 32, 5, 6);
-      ctx.fillRect(tx + 2, cy - 32, 5, 6);
-    }
-  });
-  
-  renderer.createSprite(texture, pos.x, pos.y - 5, 100, 100, renderer.decorationLayer);
-}
-
-// ─── Utility ────────────────────────────────────────────────────
-
-function pointToSegDist(px: number, py: number, ax: number, ay: number, bx: number, by: number): number {
-  const dx = bx - ax;
-  const dy = by - ay;
-  const lenSq = dx * dx + dy * dy;
-  if (lenSq === 0) return Math.sqrt((px - ax) ** 2 + (py - ay) ** 2);
-  let t = ((px - ax) * dx + (py - ay) * dy) / lenSq;
-  t = Math.max(0, Math.min(1, t));
-  const projX = ax + t * dx;
-  const projY = ay + t * dy;
-  return Math.sqrt((px - projX) ** 2 + (py - projY) ** 2);
 }
 
 // ─── Direct Canvas2D Rendering ───────────────────────────────────
@@ -1197,6 +577,44 @@ export function drawRockDirect(
 ): void {
   const theme = getTheme(levelId);
   drawRock(ctx, x, y, size, variant, theme);
+}
+
+// Prop variety (A5): the remaining decoration types are reachable from the
+// level renderer instead of being dead code.
+
+export function drawBushDirect(
+  ctx: CanvasRenderingContext2D,
+  x: number, y: number, size: number, levelId = 'level_1', variant = 0,
+): void {
+  drawBush(ctx, x, y, size, variant, getTheme(levelId));
+}
+
+export function drawMushroomDirect(
+  ctx: CanvasRenderingContext2D,
+  x: number, y: number, size: number, levelId = 'level_1',
+): void {
+  drawMushroom(ctx, x, y, size, getTheme(levelId));
+}
+
+export function drawStumpDirect(
+  ctx: CanvasRenderingContext2D,
+  x: number, y: number, size: number, levelId = 'level_1',
+): void {
+  drawStump(ctx, x, y, size, getTheme(levelId));
+}
+
+export function drawBonesDirect(
+  ctx: CanvasRenderingContext2D,
+  x: number, y: number, size: number,
+): void {
+  drawBones(ctx, x, y, size);
+}
+
+export function drawSignDirect(
+  ctx: CanvasRenderingContext2D,
+  x: number, y: number, size: number, levelId = 'level_1',
+): void {
+  drawSign(ctx, x, y, size, getTheme(levelId));
 }
 
 export function drawSpawnGateDirect(
