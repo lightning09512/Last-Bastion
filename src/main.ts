@@ -32,6 +32,18 @@ window.addEventListener('DOMContentLoaded', () => {
           loadingScreen.style.display = 'none';
           // Start game
           const game = new Game(canvas);
+
+          // QA hooks: ?debug=1 shows the F1 overlay, ?level=<id> skips the menus.
+          const params = new URLSearchParams(window.location.search);
+          const debug = params.get('debug') === '1';
+          if (debug) {
+            game.enableDebug();
+            // Expose the instance so automated browser checks can drive it.
+            (window as unknown as Record<string, unknown>).__lastBastion = game;
+          }
+          const levelId = params.get('level');
+          if (levelId) game.startLevelById(levelId);
+
           game.start();
         }, 500);
       }, 300);

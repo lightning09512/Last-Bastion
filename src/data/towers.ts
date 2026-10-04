@@ -231,6 +231,7 @@ export const TOWERS: Record<string, TowerData> = {
         cost: 70,
         damageType: 'physical',
         projectileSpeed: 0, // melee
+        soldier: { hp: 70, damage: 5, attackInterval: 1.0 },
       },
       {
         name: 'Barracks II',
@@ -241,6 +242,7 @@ export const TOWERS: Record<string, TowerData> = {
         cost: 110,
         damageType: 'physical',
         projectileSpeed: 0,
+        soldier: { hp: 105, damage: 10, attackInterval: 0.909 },
       },
       {
         name: 'Barracks III',
@@ -251,6 +253,7 @@ export const TOWERS: Record<string, TowerData> = {
         cost: 160,
         damageType: 'physical',
         projectileSpeed: 0,
+        soldier: { hp: 140, damage: 18, attackInterval: 0.833 },
       },
     ],
     specializations: [
@@ -266,6 +269,7 @@ export const TOWERS: Record<string, TowerData> = {
         cost: 230,
         damageType: 'physical',
         projectileSpeed: 0,
+        soldier: { hp: 180, damage: 20, attackInterval: 1.0 },
       },
       {
         specId: 'rangers',
@@ -279,6 +283,7 @@ export const TOWERS: Record<string, TowerData> = {
         cost: 230,
         damageType: 'physical',
         projectileSpeed: 0,
+        soldier: { hp: 140, damage: 35, attackInterval: 0.667 },
       },
     ],
   },

@@ -10,6 +10,7 @@ const DEFAULT_SAVE: SaveData = {
   upgrades: {},
   totalStars: 0,
   endlessBestWave: 0,
+  tutorialDismissed: false,
   settings: {
     muted: false,
   },

@@ -8,6 +8,13 @@ export type DamageType = 'physical' | 'magic';
 export type TargetPriority = 'first' | 'strongest' | 'closest';
 
 // ─── Tower Data ──────────────────────────────────────────────────
+/** Stats of the melee squad a barracks keeps on the field. */
+export interface SoldierStats {
+  hp: number;
+  damage: number;
+  attackInterval: number; // seconds between attacks
+}
+
 export interface TowerLevelData {
   damage: number;
   fireRate: number; // shots per second
@@ -18,6 +25,8 @@ export interface TowerLevelData {
   projectileSpeed: number;
   name: string;
   description: string;
+  /** Present on barracks levels/specializations. */
+  soldier?: SoldierStats;
 }
 
 export interface SpecializationData extends TowerLevelData {
@@ -99,6 +108,8 @@ export interface SpellData {
   radius?: number;
   delay?: number; // for rain of fire
   duration?: number;
+  /** Number of projectiles / summoned units the cast produces. */
+  count?: number;
   description: string;
 }
 
@@ -121,6 +132,8 @@ export interface SaveData {
   upgrades: Record<string, number>; // upgradeId -> level
   totalStars: number;
   endlessBestWave: number;
+  /** Set once the player skips or finishes the tutorial. */
+  tutorialDismissed: boolean;
   settings: {
     muted: boolean;
   };

@@ -2,11 +2,17 @@
 // Canvas rendering utilities for the game's visual style.
 
 import { Vec2, DESIGN_WIDTH, DESIGN_HEIGHT } from '../data/types';
+import { updateViewport, getViewport, SAFE_AREA } from './viewport';
 import {
   drawBackgroundDirect,
   drawPathDirect,
   drawTreeDirect,
   drawRockDirect,
+  drawBushDirect,
+  drawMushroomDirect,
+  drawStumpDirect,
+  drawBonesDirect,
+  drawSignDirect,
   drawSpawnGateDirect,
   drawBaseDirect,
 } from '../rendering/MapRenderer';
@@ -31,24 +37,52 @@ export class Renderer {
   }
 
   resize(): void {
-    const dpr = window.devicePixelRatio || 1;
-    const w = window.innerWidth;
-    const h = window.innerHeight;
-    this.canvas.width = w * dpr;
-    this.canvas.height = h * dpr;
-    this.canvas.style.width = `${w}px`;
-    this.canvas.style.height = `${h}px`;
-    // Scale context so we draw in design resolution space
-    this.ctx.setTransform(
-      (w * dpr) / DESIGN_WIDTH,
-      0, 0,
-      (h * dpr) / DESIGN_HEIGHT,
-      0, 0,
+    const cssW = window.innerWidth;
+    const cssH = window.innerHeight;
+    const vp = updateViewport(cssW, cssH);
+
+    this.canvas.width = Math.round(cssW * vp.dpr);
+    this.canvas.height = Math.round(cssH * vp.dpr);
+    this.canvas.style.width = `${cssW}px`;
+    this.canvas.style.height = `${cssH}px`;
+
+    this.applyWorldTransform();
+  }
+
+  /**
+   * A0: uniform scale + centring, so the 1280×720 design space keeps its
+   * aspect ratio on any window instead of being stretched per axis.
+   */
+  private applyWorldTransform(): void {
+    const ctx = this.ctx;
+    const vp = getViewport();
+    ctx.setTransform(
+      vp.dpr * vp.scale, 0,
+      0, vp.dpr * vp.scale,
+      vp.dpr * vp.offsetX, vp.dpr * vp.offsetY,
     );
   }
 
+  /** Design-space margin UI should keep clear of device edges. */
+  get safeArea(): number {
+    return SAFE_AREA;
+  }
+
+  /** Letterbox scale factor, exposed for diagnostics. */
+  get viewportScale(): number {
+    return getViewport().scale;
+  }
+
   clear(): void {
-    this.ctx.clearRect(0, 0, DESIGN_WIDTH, DESIGN_HEIGHT);
+    const ctx = this.ctx;
+    // Letterbox bars live in device space, outside the world transform.
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = '#07070c';
+    ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+
+    this.applyWorldTransform();
+    ctx.fillStyle = '#0a0a12';
+    ctx.fillRect(0, 0, DESIGN_WIDTH, DESIGN_HEIGHT);
   }
 
   // ─── Map Drawing (Kingdom Rush Visuals) ──────────────────────
@@ -94,6 +128,26 @@ export class Renderer {
 
   drawRock(x: number, y: number, size: number, levelId = 'level_1', variant = 0): void {
     drawRockDirect(this.ctx, x, y, size, levelId, variant);
+  }
+
+  drawBush(x: number, y: number, size: number, levelId = 'level_1', variant = 0): void {
+    drawBushDirect(this.ctx, x, y, size, levelId, variant);
+  }
+
+  drawMushroom(x: number, y: number, size: number, levelId = 'level_1'): void {
+    drawMushroomDirect(this.ctx, x, y, size, levelId);
+  }
+
+  drawStump(x: number, y: number, size: number, levelId = 'level_1'): void {
+    drawStumpDirect(this.ctx, x, y, size, levelId);
+  }
+
+  drawBones(x: number, y: number, size: number): void {
+    drawBonesDirect(this.ctx, x, y, size);
+  }
+
+  drawSign(x: number, y: number, size: number, levelId = 'level_1'): void {
+    drawSignDirect(this.ctx, x, y, size, levelId);
   }
 
   // ─── Vignette ───────────────────────────────────────────────

@@ -1,7 +1,10 @@
 // ─── Input Manager ───────────────────────────────────────────────
 // Handles mouse and touch input, translating screen coords to game coords.
+// A0: mapping goes through core/viewport so it always matches the
+// letterboxed render transform (uniform scale, no per-axis stretching).
 
-import { Vec2, DESIGN_WIDTH, DESIGN_HEIGHT } from '../data/types';
+import { Vec2 } from '../data/types';
+import { screenToWorld } from './viewport';
 
 export interface InputState {
   /** Current pointer position in game (design) coordinates */
@@ -32,13 +35,7 @@ export class InputManager {
   }
 
   private screenToGame(screenX: number, screenY: number): Vec2 {
-    const rect = this.canvas.getBoundingClientRect();
-    const scaleX = DESIGN_WIDTH / rect.width;
-    const scaleY = DESIGN_HEIGHT / rect.height;
-    return {
-      x: (screenX - rect.left) * scaleX,
-      y: (screenY - rect.top) * scaleY,
-    };
+    return screenToWorld(screenX, screenY, this.canvas.getBoundingClientRect());
   }
 
   private setupListeners(): void {
@@ -87,6 +84,8 @@ export class InputManager {
 
     // Keyboard events
     window.addEventListener('keydown', (e) => {
+      // F1 is the debug overlay; keep the browser help panel out of the way.
+      if (e.key === 'F1') e.preventDefault();
       this.state.keysJustPressed.add(e.key.toLowerCase());
     });
 

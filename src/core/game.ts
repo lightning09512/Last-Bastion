@@ -8,17 +8,20 @@ import {
 import { TOWERS } from '../data/towers';
 import { ENEMIES } from '../data/enemies';
 import { LEVELS } from '../data/levels';
+import { BALANCE } from '../data/balance';
 import { Renderer } from './renderer';
 import { InputManager } from './input';
 import { ObjectPool } from './pool';
-import { dist, lerpVec, angle, pointInCircle, normalize } from './utils';
+import { dist, lerp, lerpVec, pointInCircle } from './utils';
 import { loadSave, writeSave } from './save';
 import type { SaveData } from '../data/types';
 import { drawTowerDirect } from '../rendering/TowerRenderer';
 import { drawEnemyDirect, drawSoldierDirect } from '../rendering/EnemyRenderer';
 import { drawProjectileDirect } from '../rendering/ProjectileRenderer';
-import { SPELLS } from '../data/spells';
-import { playSound, playMusic, stopMusic, toggleMute, isMuted, initAudio } from './audio';
+import { getSpell } from '../data/spells';
+import { playSound, playMusic, stopMusic, toggleMute, isMuted, setMuted, initAudio } from './audio';
+import { DebugOverlay } from './debug';
+import { lighten } from './color';
 
 // ─── Runtime Entity Types ────────────────────────────────────────
 
@@ -26,6 +29,8 @@ interface Enemy {
   id: number;
   dataId: string;
   x: number; y: number;
+  /** Position at the previous fixed step, used for render interpolation (A1). */
+  prevX: number; prevY: number;
   hp: number; maxHp: number;
   speed: number;
   armor: number;
@@ -45,13 +50,20 @@ interface Enemy {
   totalPathDist: number; // for "first" targeting
   facingLeft?: boolean;
   blockedBySoldierId?: number | null;
-  abilityTimer?: number;
+  /** Independent timers for the abilities declared in ENEMIES[].abilities. */
+  meleeTimer?: number;
+  healTimer?: number;
+  regenTimer?: number;
+  summonTimer?: number;
+  stunTimer?: number;
 }
 
 interface Soldier {
   id: number;
   towerId: number | null;
   x: number; y: number;
+  /** Position at the previous fixed step, used for render interpolation (A1). */
+  prevX: number; prevY: number;
   targetX: number; targetY: number;
   hp: number; maxHp: number;
   damage: number;
@@ -68,7 +80,9 @@ interface Soldier {
 }
 
 interface Meteor {
+  id: number;
   x: number; y: number;
+  prevX: number; prevY: number;
   startX: number; startY: number;
   targetX: number; targetY: number;
   progress: number;
@@ -79,7 +93,11 @@ interface Meteor {
 }
 
 interface Projectile {
+  id: number;
   x: number; y: number;
+  prevX: number; prevY: number;
+  /** Last known position of the locked target; used when it dies mid-flight. */
+  destX: number; destY: number;
   targetId: number;
   speed: number;
   damage: number;
@@ -143,10 +161,13 @@ interface RadialMenu {
 }
 
 // ─── Map Decorations ─────────────────────────────────────────────
+export type DecorationType = 'tree' | 'rock' | 'bush' | 'mushroom' | 'stump' | 'bones' | 'sign';
+
 interface Decoration {
   x: number; y: number;
-  type: 'tree' | 'rock';
+  type: DecorationType;
   size: number;
+  variant: number;
 }
 
 export class Game {
@@ -169,9 +190,8 @@ export class Game {
   private currentWaveIndex = 0;
   private waveActive = false;
   private waveSpawnTimers: { groupIndex: number; spawnCount: number; timer: number; delayTimer: number }[] = [];
-  private waveComplete = false;
   private allWavesComplete = false;
-  private timeBetweenWaves = 15; // seconds auto-countdown
+  private timeBetweenWaves = BALANCE.wave.timeBetweenWaves;
   private waveTimer = 0; // countdown to next wave
   private waitingForWave = false;
 
@@ -180,6 +200,12 @@ export class Game {
   private towers: Tower[] = [];
   private nextEnemyId = 1;
   private nextTowerId = 1;
+  private nextProjectileId = 1;
+  private nextMeteorId = 1;
+  /** Simulation clock in seconds, used for splash source throttling. */
+  private simTime = 0;
+  /** sourceKey → (enemyId → simTime of last hit) for splash throttling. */
+  private splashHits = new Map<string, Map<number, number>>();
 
   // Object pools
   private projectilePool: ObjectPool<Projectile>;
@@ -189,7 +215,6 @@ export class Game {
   // UI
   private radialMenu: RadialMenu | null = null;
   private selectedSlot: number = -1;
-  private hoveredSlot: number = -1;
   private selectedTower: Tower | null = null;
 
   // Map decorations
@@ -200,6 +225,12 @@ export class Game {
 
   // Menu animation
   private menuTime = 0;
+
+  /** A1: fraction of the pending fixed step, used to interpolate rendering. */
+  private renderAlpha = 0;
+
+  /** A18: frame-time and budget overlay, toggled with F1. */
+  private debug = new DebugOverlay();
 
   // Victory/Defeat
   private resultStars = 0;
@@ -231,22 +262,31 @@ export class Game {
     this.renderer = new Renderer(canvas);
     this.input = new InputManager(canvas);
     this.save = loadSave();
+    this.tutorialDismissed = this.save.tutorialDismissed;
+    if (this.save.settings.muted) setMuted(true);
 
-    // Initialize pools
+    // Initialize pools (D4: hard caps so effects are recycled, never dropped)
     this.projectilePool = new ObjectPool<Projectile>(
-      () => ({ x: 0, y: 0, targetId: -1, speed: 0, damage: 0, damageType: 'physical', splashRadius: 0, active: false, color: '#fff', trail: [] }),
+      () => ({
+        id: 0, x: 0, y: 0, prevX: 0, prevY: 0, destX: 0, destY: 0,
+        targetId: -1, speed: 0, damage: 0, damageType: 'physical',
+        splashRadius: 0, active: false, color: '#fff', trail: [],
+      }),
       (p) => { p.active = false; p.trail.length = 0; },
-      100,
+      BALANCE.pools.projectileInitial,
+      BALANCE.pools.projectileMax,
     );
     this.textPool = new ObjectPool<FloatingText>(
       () => ({ x: 0, y: 0, text: '', color: '#fff', life: 0, maxLife: 1, active: false, size: 14 }),
       (t) => { t.active = false; },
-      40,
+      BALANCE.pools.textInitial,
+      BALANCE.pools.textMax,
     );
     this.particlePool = new ObjectPool<Particle>(
       () => ({ x: 0, y: 0, vx: 0, vy: 0, life: 0, maxLife: 1, color: '#fff', size: 3, active: false }),
       (p) => { p.active = false; },
-      200,
+      BALANCE.pools.particleInitial,
+      BALANCE.pools.particleMax,
     );
   }
 
@@ -263,18 +303,38 @@ export class Game {
   }
 
   private loop(time: number): void {
+    this.debug.beginFrame(time);
+
     const frameTime = Math.min((time - this.lastTime) / 1000, 0.1); // cap at 100ms
     this.lastTime = time;
     this.accumulator += frameTime;
 
-    // Fixed timestep update
+    // Fixed timestep update. One-shot input flags are consumed after the
+    // first step so a multi-step frame can never act on one click twice.
+    let stepped = false;
     while (this.accumulator >= FIXED_DT) {
       this.update(FIXED_DT);
       this.accumulator -= FIXED_DT;
+      if (!stepped) {
+        this.input.consumeClick();
+        stepped = true;
+      }
     }
 
+    // A1: how far we are between the last two simulated states.
+    this.renderAlpha = Math.min(1, this.accumulator / FIXED_DT);
+
     this.render();
-    this.input.consumeClick();
+
+    this.debug.report({
+      entities: this.enemies.length + this.soldiers.length + this.towers.length,
+      enemies: this.enemies.length,
+      particles: this.particlePool.activeCount,
+      projectiles: this.projectilePool.activeCount,
+    });
+    this.debug.draw(this.renderer.ctx);
+    this.debug.endFrame();
+
     requestAnimationFrame((t) => this.loop(t));
   }
 
@@ -283,6 +343,11 @@ export class Game {
   // ═══════════════════════════════════════════════════════════════
 
   private update(dt: number): void {
+    // A18: F1 toggles the debug overlay from any screen.
+    if (this.input.getState().keysJustPressed.has('f1')) {
+      this.debug.toggle();
+    }
+
     this.menuTime += dt;
 
     switch (this.screen) {
@@ -347,11 +412,59 @@ export class Game {
       // Sound button (Top-Right)
       if (inp.clickPos.x >= DESIGN_WIDTH - 80 && inp.clickPos.x <= DESIGN_WIDTH - 24 &&
           inp.clickPos.y >= 20 && inp.clickPos.y <= 60) {
-        toggleMute();
+        this.toggleMutePersisted();
         playSound('button_click');
         return;
       }
     }
+  }
+
+  /** Mute toggle that survives a reload (5). */
+  private toggleMutePersisted(): void {
+    const muted = toggleMute();
+    this.save.settings.muted = muted;
+    writeSave(this.save);
+  }
+
+  // ─── Dev hooks (QA only) ───────────────────────────────────────
+
+  /** A18: turn the debug overlay on from the URL (`?debug=1`). */
+  enableDebug(): void {
+    this.debug.enabled = true;
+  }
+
+  /** Jump straight into a level from the URL (`?level=level_3`). */
+  startLevelById(levelId: string): boolean {
+    const level = LEVELS.find((l) => l.id === levelId);
+    if (!level) return false;
+    this.startLevel(level);
+    return true;
+  }
+
+  /** Number of active enemies, used by QA harnesses. */
+  get enemyCount(): number {
+    return this.enemies.length;
+  }
+
+  /** QA: live frame statistics measured by the debug overlay (A18). */
+  getQaSnapshot(): {
+    fps: number; frameP50: number; frameP95: number;
+    enemies: number; entities: number; particles: number; projectiles: number;
+    peakEntities: number; peakParticles: number;
+    screen: string;
+  } {
+    return {
+      fps: this.debug.fps,
+      frameP50: this.debug.frameP50,
+      frameP95: this.debug.frameP95,
+      enemies: this.enemies.length,
+      entities: this.enemies.length + this.soldiers.length + this.towers.length,
+      particles: this.particlePool.activeCount,
+      projectiles: this.projectilePool.activeCount,
+      peakEntities: this.debug.peakEntities,
+      peakParticles: this.debug.peakParticles,
+      screen: this.screen,
+    };
   }
 
   // ─── World Map ─────────────────────────────────────────────────
@@ -423,7 +536,7 @@ export class Game {
       // Top bar Sound button
       if (inp.clickPos.x >= DESIGN_WIDTH - 70 && inp.clickPos.x <= DESIGN_WIDTH - 20 &&
           inp.clickPos.y >= 10 && inp.clickPos.y <= 46) {
-        toggleMute();
+        this.toggleMutePersisted();
         playSound('button_click');
         return;
       }
@@ -455,9 +568,7 @@ export class Game {
     this.waves = level.waves;
     this.currentWaveIndex = 0;
     this.waveActive = false;
-    this.waveComplete = false;
     this.allWavesComplete = false;
-    this.waveTimer = this.timeBetweenWaves;
     this.waitingForWave = true;
     this.enemies = [];
     this.towers = [];
@@ -473,6 +584,10 @@ export class Game {
     this.selectedTower = null;
     this.nextEnemyId = 1;
     this.nextTowerId = 1;
+    this.nextProjectileId = 1;
+    this.nextMeteorId = 1;
+    this.simTime = 0;
+    this.splashHits.clear();
     this.gameSpeed = 1;
     this.paused = false;
     this.isFirstLevel = level.id === 'level_1';
@@ -480,8 +595,8 @@ export class Game {
     this.screen = 'level';
     this.generateDecorations();
 
-    // Auto-start first wave after short delay
-    this.waveTimer = 5;
+    // Auto-start the first wave after a short grace period (g: single source).
+    this.waveTimer = BALANCE.wave.firstWaveDelay;
   }
 
   private generateDecorations(): void {
@@ -492,37 +607,49 @@ export class Game {
     const path = this.currentLevel.path;
     const slots = this.currentLevel.buildSlots;
 
-    for (let i = 0; i < 35; i++) {
+    const dec = BALANCE.decorations;
+    const props = dec.props;
+    const totalWeight = props.reduce((sum, p) => sum + p.weight, 0);
+
+    for (let i = 0; i < dec.count; i++) {
       let x: number, y: number;
       let valid = false;
       let attempts = 0;
 
       do {
-        x = 30 + Math.random() * (DESIGN_WIDTH - 60);
-        y = 30 + Math.random() * (DESIGN_HEIGHT - 100);
+        x = dec.minX + Math.random() * (DESIGN_WIDTH - dec.minX * 2);
+        y = dec.minY + Math.random() * (DESIGN_HEIGHT - dec.minY - 70);
         valid = true;
 
         // Check distance from path
         for (const wp of path) {
-          if (dist({ x, y }, wp) < 55) { valid = false; break; }
+          if (dist({ x, y }, wp) < dec.pathClearance) { valid = false; break; }
         }
         // Check distance from build slots
         if (valid) {
           for (const s of slots) {
-            if (dist({ x, y }, s) < 40) { valid = false; break; }
+            if (dist({ x, y }, s) < dec.slotClearance) { valid = false; break; }
           }
         }
         attempts++;
-      } while (!valid && attempts < 20);
+      } while (!valid && attempts < dec.maxAttempts);
 
-      if (valid) {
-        const isTree = Math.random() > 0.35;
-        this.decorations.push({
-          x, y,
-          type: isTree ? 'tree' : 'rock',
-          size: isTree ? (34 + Math.random() * 22) : (14 + Math.random() * 12),
-        });
+      if (!valid) continue;
+
+      // Weighted pick so every prop type appears, with a random variant (A5).
+      let roll = Math.random() * totalWeight;
+      let chosen: (typeof props)[number] = props[0];
+      for (const p of props) {
+        roll -= p.weight;
+        if (roll <= 0) { chosen = p; break; }
       }
+
+      this.decorations.push({
+        x, y,
+        type: chosen.type,
+        size: chosen.sizeMin + Math.random() * (chosen.sizeMax - chosen.sizeMin),
+        variant: chosen.variants > 1 ? Math.floor(Math.random() * chosen.variants) : 0,
+      });
     }
     // Depth sorting
     this.decorations.sort((a, b) => a.y - b.y);
@@ -530,11 +657,14 @@ export class Game {
 
   private updateLevel(dt: number): void {
     if (this.paused) {
+      // Pause freezes the match: only pause/Esc input is accepted.
       this.handleLevelInput();
       return;
     }
 
     const effectiveDt = dt * this.gameSpeed;
+    this.simTime += effectiveDt;
+    this.capturePositions();
 
     // Wave management
     this.updateWaves(effectiveDt);
@@ -565,6 +695,39 @@ export class Game {
 
     // Input
     this.handleLevelInput();
+  }
+
+  /**
+   * A1: remember every moving entity's position before the step so the
+   * renderer can interpolate between the last two simulated states.
+   */
+  private capturePositions(): void {
+    for (const e of this.enemies) { e.prevX = e.x; e.prevY = e.y; }
+    for (const s of this.soldiers) { s.prevX = s.x; s.prevY = s.y; }
+    for (const p of this.projectilePool.getActive()) { p.prevX = p.x; p.prevY = p.y; }
+    for (const m of this.meteors) { m.prevX = m.x; m.prevY = m.y; }
+  }
+
+  /**
+   * A1: draw a moving entity at its interpolated position without
+   * allocating a copy every frame.
+   */
+  private drawInterpolated<T extends { x: number; y: number; prevX: number; prevY: number }>(
+    entity: T,
+    draw: (view: T) => void,
+  ): void {
+    const a = this.renderAlpha;
+    if (a <= 0.0001) {
+      draw(entity);
+      return;
+    }
+    const x = entity.x;
+    const y = entity.y;
+    entity.x = lerp(entity.prevX, x, a);
+    entity.y = lerp(entity.prevY, y, a);
+    draw(entity);
+    entity.x = x;
+    entity.y = y;
   }
 
   // ─── Wave System ───────────────────────────────────────────────
@@ -656,13 +819,15 @@ export class Game {
     if (!data || !this.currentLevel) return;
 
     const spawn = this.currentLevel.spawnPosition;
-    const laneOffset = (Math.random() - 0.5) * 12;
+    const laneOffset = (Math.random() - 0.5) * BALANCE.enemy.laneOffset * 2;
 
     const enemy: Enemy = {
       id: this.nextEnemyId++,
       dataId,
       x: spawn.x,
       y: spawn.y,
+      prevX: spawn.x,
+      prevY: spawn.y,
       hp: data.hp,
       maxHp: data.hp,
       speed: data.speed,
@@ -681,6 +846,8 @@ export class Game {
       slowed: 0,
       slowFactor: 1,
       totalPathDist: 0,
+      // Always a boolean so renderers never see an undefined facing (fix b).
+      facingLeft: spawn.x > (this.currentLevel.basePosition.x),
     };
 
     this.enemies.push(enemy);
@@ -709,17 +876,20 @@ export class Game {
           enemy.blockedBySoldierId = null;
         } else {
           // Stopped by soldier! Melee clash!
-          enemy.abilityTimer = (enemy.abilityTimer || 0) + dt;
-          if (enemy.abilityTimer >= 0.8) {
-            enemy.abilityTimer = 0;
-            const enemyDamage = Math.max(5, Math.round(enemy.maxHp * 0.08));
+          enemy.meleeTimer = (enemy.meleeTimer ?? 0) + dt;
+          if (enemy.meleeTimer >= BALANCE.enemy.melee.interval) {
+            enemy.meleeTimer = 0;
+            const enemyDamage = Math.max(
+              BALANCE.enemy.melee.minDamage,
+              Math.round(enemy.maxHp * BALANCE.enemy.melee.maxHpRatio),
+            );
             soldier.hp -= enemyDamage;
             soldier.hitFlash = 0.2;
             this.spawnFloatingText(soldier.x, soldier.y - 12, `-${enemyDamage}`, '#ef4444', 12);
             this.spawnParticles(soldier.x, soldier.y, '#ef4444', 3);
             if (soldier.hp <= 0) {
               soldier.alive = false;
-              soldier.respawnTimer = 10;
+              soldier.respawnTimer = BALANCE.soldier.respawnTime;
               enemy.blockedBySoldierId = null;
               this.spawnParticles(soldier.x, soldier.y, '#475569', 8);
             }
@@ -728,50 +898,51 @@ export class Game {
         }
       }
 
-      // Enemy Abilities: Dark Shaman healing, Troll regen, Orc Warlord summons/stuns
-      if (enemy.dataId === 'dark_shaman') {
-        enemy.abilityTimer = (enemy.abilityTimer || 0) + dt;
-        if (enemy.abilityTimer >= 3.5) {
-          enemy.abilityTimer = 0;
+      // Enemy abilities — every number comes from ENEMIES[].abilities (B0),
+      // with an independent timer per ability so a unit may have several.
+      const abilities = ENEMIES[enemy.dataId]?.abilities;
+      if (abilities?.heal) {
+        const heal = abilities.heal;
+        enemy.healTimer = (enemy.healTimer ?? 0) + dt;
+        if (enemy.healTimer >= heal.interval) {
+          enemy.healTimer = 0;
           playSound('shaman_heal');
           for (const ally of this.enemies) {
-            if (ally.alive && !ally.flying && dist(enemy, ally) <= 80 && ally.hp < ally.maxHp) {
-              ally.hp = Math.min(ally.maxHp, ally.hp + 12);
-              this.spawnFloatingText(ally.x, ally.y - 10, '+12', '#22c55e', 13);
+            if (ally.alive && !ally.flying && dist(enemy, ally) <= heal.range && ally.hp < ally.maxHp) {
+              ally.hp = Math.min(ally.maxHp, ally.hp + heal.amount);
+              this.spawnFloatingText(ally.x, ally.y - 10, `+${heal.amount}`, '#22c55e', 13);
               this.spawnParticles(ally.x, ally.y, '#22c55e', 4);
             }
           }
         }
-      } else if (enemy.dataId === 'troll' && enemy.hp < enemy.maxHp) {
-        enemy.abilityTimer = (enemy.abilityTimer || 0) + dt;
-        if (enemy.abilityTimer >= 1.0) {
-          enemy.abilityTimer = 0;
-          enemy.hp = Math.min(enemy.maxHp, enemy.hp + 5);
+      }
+      if (abilities?.regen && enemy.hp < enemy.maxHp) {
+        const regen = abilities.regen;
+        enemy.regenTimer = (enemy.regenTimer ?? 0) + dt;
+        if (enemy.regenTimer >= regen.interval) {
+          enemy.regenTimer = 0;
+          enemy.hp = Math.min(enemy.maxHp, enemy.hp + regen.amount);
           this.spawnParticles(enemy.x, enemy.y, '#84cc16', 2);
         }
-      } else if (enemy.dataId === 'orc_warlord') {
-        enemy.abilityTimer = (enemy.abilityTimer || 0) + dt;
-        if (enemy.abilityTimer >= 9.0) {
-          enemy.abilityTimer = 0;
+      }
+      if (abilities?.summon) {
+        const summon = abilities.summon;
+        enemy.summonTimer = (enemy.summonTimer ?? 0) + dt;
+        if (enemy.summonTimer >= summon.interval) {
+          enemy.summonTimer = 0;
+          this.summonMinions(enemy, summon.enemyId, summon.count);
+        }
+      }
+      if (abilities?.stun) {
+        const stun = abilities.stun;
+        enemy.stunTimer = (enemy.stunTimer ?? 0) + dt;
+        if (enemy.stunTimer >= stun.interval) {
+          enemy.stunTimer = 0;
           playSound('warlord_roar');
-          // Summon 2 goblins
-          for (let i = 0; i < 2; i++) {
-            this.spawnEnemy('goblin');
-            const g = this.enemies[this.enemies.length - 1];
-            if (g) {
-              g.x = enemy.x + (i === 0 ? -20 : 20);
-              g.y = enemy.y + (Math.random() - 0.5) * 15;
-              g.pathIndex = enemy.pathIndex;
-              g.pathProgress = enemy.pathProgress;
-              this.spawnParticles(g.x, g.y, '#dc2626', 8);
-            }
-          }
           this.spawnFloatingText(enemy.x, enemy.y - 25, 'WAR CRY!', '#ef4444', 16);
-
-          // Stun towers in range
           for (const tower of this.towers) {
-            if (dist(enemy, tower) <= 130) {
-              tower.stunTimer = 2.5;
+            if (dist(enemy, tower) <= stun.range) {
+              tower.stunTimer = stun.duration;
             }
           }
         }
@@ -783,6 +954,9 @@ export class Game {
         const dx = base.x - enemy.x;
         const dy = base.y - enemy.y;
         const d = Math.sqrt(dx * dx + dy * dy);
+        // Fix (b): flyers must face their direction of travel too.
+        if (dx < -1) enemy.facingLeft = true;
+        else if (dx > 1) enemy.facingLeft = false;
         const spd = enemy.speed * enemy.slowFactor * dt;
         if (d <= spd) {
           this.enemyReachesBase(enemy);
@@ -832,6 +1006,37 @@ export class Game {
 
     // Remove dead enemies
     this.enemies = this.enemies.filter(e => e.alive);
+  }
+
+  /**
+   * Summon minions beside `summoner`, standing on the path at the summoner's
+   * own progress so they can never be teleported past the base (fix 9).
+   */
+  private summonMinions(summoner: Enemy, enemyId: string, count: number): void {
+    if (!this.currentLevel) return;
+    const path = this.currentLevel.path;
+    if (path.length < 2) return;
+
+    const progress = Math.min(summoner.pathProgress, 0.5);
+    const idx = Math.min(Math.max(1, summoner.pathIndex), path.length - 1);
+    const from = path[idx - 1] ?? path[0];
+    const to = path[idx] ?? path[path.length - 1];
+    const anchor = lerpVec(from, to, progress);
+
+    for (let i = 0; i < count; i++) {
+      this.spawnEnemy(enemyId);
+      const minion = this.enemies[this.enemies.length - 1];
+      if (!minion) continue;
+
+      const spread = (i - (count - 1) / 2) * BALANCE.enemy.summonSpread;
+      minion.x = anchor.x + spread;
+      minion.y = anchor.y + (Math.random() - 0.5) * BALANCE.enemy.laneOffset * 2;
+      minion.prevX = minion.x;
+      minion.prevY = minion.y;
+      minion.pathIndex = idx;
+      minion.pathProgress = progress;
+      this.spawnParticles(minion.x, minion.y, '#dc2626', 8);
+    }
   }
 
   private enemyReachesBase(enemy: Enemy): void {
@@ -985,17 +1190,17 @@ export class Game {
 
   private updateTowers(dt: number): void {
     for (const tower of this.towers) {
-      // Barracks soldiers fight in melee, no projectile
-      if (tower.dataId === 'barracks') continue;
-
-      // Stun timer
+      // Stun timer — applies to every tower, barracks included (fix c).
       if (tower.stunTimer > 0) {
         tower.stunTimer -= dt;
-        continue;
       }
 
       // Animation timer
       if (tower.animTimer > 0) tower.animTimer -= dt;
+
+      // Barracks soldiers fight in melee, no projectile
+      if (tower.dataId === 'barracks') continue;
+      if (tower.stunTimer > 0) continue;
 
       const stats = this.getTowerStats(tower);
       const towerData = TOWERS[tower.dataId];
@@ -1007,9 +1212,9 @@ export class Game {
         if (target) {
           this.fireTower(tower, target, stats);
           tower.fireTimer = 1 / stats.fireRate;
-          tower.animTimer = 0.15;
+          tower.animTimer = BALANCE.tower.attackAnimDuration;
         } else {
-          tower.fireTimer = 0.1; // Retry quickly
+          tower.fireTimer = BALANCE.tower.retryDelay; // Retry quickly
         }
       }
     }
@@ -1066,9 +1271,14 @@ export class Game {
 
     for (let i = 0; i < shotCount; i++) {
       const proj = this.projectilePool.acquire();
+      proj.id = this.nextProjectileId++;
       proj.x = tower.x;
       proj.y = tower.y - 10; // Slight upward offset for tower height
+      proj.prevX = proj.x;
+      proj.prevY = proj.y;
       proj.targetId = target.id;
+      proj.destX = target.x;
+      proj.destY = target.y;
       proj.speed = stats.projectileSpeed;
       proj.damage = stats.damage;
       proj.damageType = stats.damageType;
@@ -1093,49 +1303,48 @@ export class Game {
     for (const proj of this.projectilePool.getActive()) {
       if (!proj.active) { toRelease.push(proj); continue; }
 
-      // Find target
-      const target = this.enemies.find(e => e.id === proj.targetId && e.alive);
+      // Locked target, or the nearest replacement if it died (fix d).
+      let target = this.enemies.find(e => e.id === proj.targetId && e.alive);
       if (!target) {
-        proj.active = false;
-        toRelease.push(proj);
-        continue;
+        target = this.findRetarget(proj) ?? undefined;
+        if (target) {
+          proj.targetId = target.id;
+        }
+      }
+      if (target) {
+        proj.destX = target.x;
+        proj.destY = target.y;
       }
 
-      // Move toward target
-      const dx = target.x - proj.x;
-      const dy = target.y - proj.y;
+      // Move toward the remembered destination.
+      const dx = proj.destX - proj.x;
+      const dy = proj.destY - proj.y;
       const d = Math.sqrt(dx * dx + dy * dy);
       const moveSpeed = proj.speed * dt;
 
       // Store trail
       proj.trail.push({ x: proj.x, y: proj.y });
-      if (proj.trail.length > 6) proj.trail.shift();
+      if (proj.trail.length > BALANCE.projectile.trailLength) proj.trail.shift();
 
-      if (d <= moveSpeed + target.size) {
-        // Hit!
+      const hitRadius = moveSpeed + (target ? target.size : 6);
+      if (d <= hitRadius) {
+        const impactX = proj.destX;
+        const impactY = proj.destY;
+
         if (proj.splashRadius > 0) {
           playSound('cannon_hit');
-          // Splash damage
-          for (const enemy of this.enemies) {
-            if (!enemy.alive) continue;
-            if (dist({ x: target.x, y: target.y }, { x: enemy.x, y: enemy.y }) <= proj.splashRadius) {
-              this.damageEnemy(enemy, proj.damage, proj.damageType);
-            }
-          }
-          this.spawnParticles(target.x, target.y, '#ff6600', 6);
-        } else {
+          this.applySplashDamage(`proj:${proj.id}`, impactX, impactY, proj.splashRadius, proj.damage, proj.damageType);
+          this.spawnParticles(impactX, impactY, '#ff6600', 6);
+        } else if (target) {
           if (proj.damageType === 'magic') {
             playSound('magic_hit');
           } else {
             playSound('arrow_hit');
           }
           this.damageEnemy(target, proj.damage, proj.damageType);
-        }
-
-        // Slow hex effect
-        if (proj.damageType === 'magic') {
-          // Check if the shooting tower has slow_hex spec
-          // We track this by color matching (simplified)
+        } else {
+          // Target died and nothing else was in reach: fizzle instead of teleporting.
+          this.spawnParticles(impactX, impactY, proj.color, 2);
         }
 
         proj.active = false;
@@ -1151,6 +1360,56 @@ export class Game {
     }
   }
 
+  /** Nearest live enemy to a stray projectile, within the retarget radius. */
+  private findRetarget(proj: Projectile): Enemy | null {
+    let best: Enemy | null = null;
+    let bestDist: number = BALANCE.projectile.retargetRadius;
+    for (const enemy of this.enemies) {
+      if (!enemy.alive) continue;
+      const d = dist({ x: proj.x, y: proj.y }, enemy);
+      if (d <= bestDist) {
+        bestDist = d;
+        best = enemy;
+      }
+    }
+    return best;
+  }
+
+  /**
+   * B3: splash damage falls off linearly from the centre and a single source
+   * cannot hit the same enemy twice inside the same window.
+   */
+  private applySplashDamage(
+    sourceKey: string,
+    x: number, y: number,
+    radius: number,
+    damage: number,
+    damageType: 'physical' | 'magic',
+  ): void {
+    if (radius <= 0) return;
+
+    let hits = this.splashHits.get(sourceKey);
+    if (!hits) {
+      hits = new Map<number, number>();
+      this.splashHits.set(sourceKey, hits);
+    }
+
+    const edge = BALANCE.splash.edgeFalloff;
+    for (const enemy of this.enemies) {
+      if (!enemy.alive) continue;
+
+      const d = dist({ x, y }, enemy);
+      if (d > radius) continue;
+
+      const last = hits.get(enemy.id);
+      if (last !== undefined && this.simTime - last < BALANCE.splash.sameSourceCooldown) continue;
+      hits.set(enemy.id, this.simTime);
+
+      const multiplier = 1 - (1 - edge) * (d / radius);
+      this.damageEnemy(enemy, damage * multiplier, damageType);
+    }
+  }
+
   // ─── Effects ───────────────────────────────────────────────────
 
   private spawnFloatingText(x: number, y: number, text: string, color: string, size: number): void {
@@ -1159,8 +1418,8 @@ export class Game {
     ft.y = y;
     ft.text = text;
     ft.color = color;
-    ft.life = 1.2;
-    ft.maxLife = 1.2;
+    ft.life = BALANCE.vfx.floatingTextLife;
+    ft.maxLife = BALANCE.vfx.floatingTextLife;
     ft.active = true;
     ft.size = size;
   }
@@ -1171,13 +1430,16 @@ export class Game {
       p.x = x;
       p.y = y;
       const ang = Math.random() * Math.PI * 2;
-      const spd = 30 + Math.random() * 60;
+      const spd = BALANCE.vfx.particleSpeedMin
+        + Math.random() * (BALANCE.vfx.particleSpeedMax - BALANCE.vfx.particleSpeedMin);
       p.vx = Math.cos(ang) * spd;
       p.vy = Math.sin(ang) * spd;
-      p.life = 0.4 + Math.random() * 0.4;
+      p.life = BALANCE.vfx.particleLifeMin
+        + Math.random() * (BALANCE.vfx.particleLifeMax - BALANCE.vfx.particleLifeMin);
       p.maxLife = p.life;
       p.color = color;
-      p.size = 2 + Math.random() * 3;
+      p.size = BALANCE.vfx.particleSizeMin
+        + Math.random() * (BALANCE.vfx.particleSizeMax - BALANCE.vfx.particleSizeMin);
       p.active = true;
     }
   }
@@ -1187,7 +1449,7 @@ export class Game {
     for (const ft of this.textPool.getActive()) {
       if (!ft.active) { toRelease.push(ft); continue; }
       ft.life -= dt;
-      ft.y -= 30 * dt;
+      ft.y -= BALANCE.vfx.floatingTextRise * dt;
       if (ft.life <= 0) {
         ft.active = false;
         toRelease.push(ft);
@@ -1203,7 +1465,7 @@ export class Game {
       p.life -= dt;
       p.x += p.vx * dt;
       p.y += p.vy * dt;
-      p.vy += 80 * dt; // gravity
+      p.vy += BALANCE.vfx.particleGravity * dt; // gravity
       if (p.life <= 0) {
         p.active = false;
         toRelease.push(p);
@@ -1236,51 +1498,64 @@ export class Game {
       // Check current soldiers for this tower
       const mySoldiers = this.soldiers.filter(s => s.towerId === tower.id);
 
+      // Stats come from the tower's own data entry (B0).
+      const stats = this.getTowerStats(tower);
+      const squad = stats.soldier ?? BALANCE.soldier.fallback;
+      const maxHp = squad.hp;
+      const dmg = squad.damage;
+      const attackInterval = squad.attackInterval;
+
       // Type based on level / spec
-      const soldierType: 'militia' | 'footman' | 'knight' = 
+      const soldierType: 'militia' | 'footman' | 'knight' =
         tower.specId === 'knights' ? 'knight' : (tower.level > 0 ? 'footman' : 'militia');
-      const maxHp = tower.specId === 'knights' ? 180 : (70 + tower.level * 35);
-      const dmg = tower.specId === 'knights' ? 22 : (7 + tower.level * 5);
 
       // Respawn timer check for dead soldiers
       for (const s of mySoldiers) {
         if (!s.alive) {
+          // Fix (a): temporary units never come back.
+          if (s.lifespan !== undefined) continue;
           s.respawnTimer -= dt;
           if (s.respawnTimer <= 0) {
             s.alive = true;
             s.hp = maxHp;
             s.maxHp = maxHp;
             s.damage = dmg;
+            s.attackInterval = attackInterval;
             s.type = soldierType;
             s.x = tower.x;
             s.y = tower.y;
+            s.prevX = s.x;
+            s.prevY = s.y;
             this.spawnParticles(tower.x, tower.y, '#93c5fd', 6);
           }
         } else {
           // Upgrade stats if tower upgraded
           s.maxHp = maxHp;
           s.damage = dmg;
+          s.attackInterval = attackInterval;
           s.type = soldierType;
         }
       }
 
-      // If fewer than 2 total records exist, create them
-      if (mySoldiers.length < 2) {
-        for (let i = mySoldiers.length; i < 2; i++) {
-          const offsetX = (i === 0 ? -14 : 14);
+      // Maintain the squad size declared by balance.
+      if (mySoldiers.length < BALANCE.soldier.count) {
+        for (let i = mySoldiers.length; i < BALANCE.soldier.count; i++) {
+          const offsetX = (i === 0 ? -BALANCE.soldier.spread : BALANCE.soldier.spread);
           const offsetY = (i === 0 ? -6 : 6);
           this.soldiers.push({
             id: this.nextSoldierId++,
             towerId: tower.id,
             x: tower.x,
             y: tower.y,
+            prevX: tower.x,
+            prevY: tower.y,
             targetX: bestPt.x + offsetX,
             targetY: bestPt.y + offsetY,
             hp: maxHp,
             maxHp,
             damage: dmg,
-            attackTimer: 0.5,
-            attackInterval: 0.8,
+            attackTimer: attackInterval * 0.5,
+            attackInterval,
             blockingEnemyId: null,
             level: tower.level,
             type: soldierType,
@@ -1292,8 +1567,9 @@ export class Game {
       }
     }
 
-    // 2. Remove soldiers of demolished towers
+    // 2. Remove soldiers of demolished towers, and expired reinforcements (fix a)
     this.soldiers = this.soldiers.filter(s => {
+      if (s.lifespan !== undefined && !s.alive) return false;
       if (s.towerId === null) return true; // reinforcements
       return this.towers.some(t => t.id === s.towerId);
     });
@@ -1301,6 +1577,12 @@ export class Game {
     // 3. Update each soldier
     for (const soldier of this.soldiers) {
       if (!soldier.alive) continue;
+
+      // Fix (c): a stunned barracks cannot act, its squad stands down.
+      if (soldier.towerId !== null) {
+        const tower = this.towers.find(t => t.id === soldier.towerId);
+        if (tower && tower.stunTimer > 0) continue;
+      }
 
       if (soldier.hitFlash > 0) soldier.hitFlash -= dt * 4;
 
@@ -1324,7 +1606,7 @@ export class Game {
       // Melee combat
       if (soldier.blockingEnemyId) {
         const enemy = this.enemies.find(e => e.id === soldier.blockingEnemyId && e.alive);
-        if (!enemy || dist(soldier, enemy) > 35) {
+        if (!enemy || dist(soldier, enemy) > BALANCE.soldier.breakRange) {
           soldier.blockingEnemyId = null;
         } else {
           // Face enemy
@@ -1347,7 +1629,7 @@ export class Game {
       const dy = soldier.targetY - soldier.y;
       const d = Math.sqrt(dx * dx + dy * dy);
       if (d > 3) {
-        const move = Math.min(d, 55 * dt);
+        const move = Math.min(d, BALANCE.soldier.moveSpeed * dt);
         soldier.x += (dx / d) * move;
         soldier.y += (dy / d) * move;
         soldier.facingLeft = dx < 0;
@@ -1356,7 +1638,7 @@ export class Game {
         for (const enemy of this.enemies) {
           if (!enemy.alive || enemy.flying) continue;
           if (enemy.blockedBySoldierId) continue;
-          if (dist(soldier, enemy) < 28) {
+          if (dist(soldier, enemy) < BALANCE.soldier.blockRange) {
             soldier.blockingEnemyId = enemy.id;
             enemy.blockedBySoldierId = soldier.id;
             break;
@@ -1396,12 +1678,7 @@ export class Game {
         playSound('meteor_impact');
         this.spawnParticles(m.targetX, m.targetY, '#ea580c', 16);
         this.spawnParticles(m.targetX, m.targetY, '#facc15', 10);
-        for (const enemy of this.enemies) {
-          if (enemy.alive && dist({ x: m.targetX, y: m.targetY }, enemy) <= m.radius) {
-            this.damageEnemy(enemy, m.damage, 'physical');
-            this.spawnFloatingText(enemy.x, enemy.y - 10, `-${m.damage}`, '#ff4400', 14);
-          }
-        }
+        this.applySplashDamage(`meteor:${m.id}`, m.targetX, m.targetY, m.radius, m.damage, 'physical');
         this.meteors.splice(i, 1);
       }
     }
@@ -1409,54 +1686,73 @@ export class Game {
 
   private castSpell(spellId: 'rain_of_fire' | 'reinforcements', x: number, y: number): void {
     if (spellId === 'rain_of_fire') {
-      this.spellCooldowns.rain_of_fire = 30;
+      // Every number comes from data/spells.ts (B0).
+      const spell = getSpell('rain_of_fire');
+      const count = spell.count ?? 5;
+      const radius = spell.radius ?? 80;
+      const damage = spell.damage ?? 80;
+      const fallTime = spell.delay ?? 0.8;
+      const spread = radius * 0.75;
+
+      this.spellCooldowns.rain_of_fire = spell.cooldown;
       playSound('meteor_fall');
-      // Spawn 5 raining meteors falling into target area
-      for (let i = 0; i < 5; i++) {
-        const targetX = x + (Math.random() - 0.5) * 60;
-        const targetY = y + (Math.random() - 0.5) * 60;
-        const startX = targetX + (Math.random() - 0.5) * 80;
+
+      for (let i = 0; i < count; i++) {
+        const targetX = x + (Math.random() - 0.5) * spread;
+        const targetY = y + (Math.random() - 0.5) * spread;
+        const startX = targetX + (Math.random() - 0.5) * spread;
         const startY = -60 - i * 40;
         this.meteors.push({
+          id: this.nextMeteorId++,
           x: startX,
           y: startY,
+          prevX: startX,
+          prevY: startY,
           startX,
           startY,
           targetX,
           targetY,
           progress: 0,
-          speed: 2.2 + Math.random() * 0.8,
-          damage: 50,
-          radius: 65,
+          speed: 1 / Math.max(0.1, fallTime),
+          damage,
+          radius,
           active: true,
         });
       }
       this.spawnFloatingText(x, y - 30, 'RAIN OF FIRE!', '#ff4400', 16);
     } else if (spellId === 'reinforcements') {
-      this.spellCooldowns.reinforcements = 20;
+      const spell = getSpell('reinforcements');
+      const count = spell.count ?? 2;
+      const squad = BALANCE.soldier.reinforcement;
+      const lifespan = spell.duration ?? 15;
+
+      this.spellCooldowns.reinforcements = spell.cooldown;
       playSound('reinforce');
-      // Spawn 2 volunteer soldiers
-      for (let i = 0; i < 2; i++) {
-        const sx = x + (i === 0 ? -12 : 12);
+
+      for (let i = 0; i < count; i++) {
+        const offset = (i - (count - 1) / 2) * BALANCE.soldier.spread;
+        const sx = x + offset;
         const sy = y + (Math.random() - 0.5) * 10;
         this.soldiers.push({
           id: this.nextSoldierId++,
           towerId: null,
           x: sx,
           y: sy,
+          prevX: sx,
+          prevY: sy,
           targetX: sx,
           targetY: sy,
-          hp: 60,
-          maxHp: 60,
-          damage: 8,
-          attackTimer: 0.5,
-          attackInterval: 0.9,
+          hp: squad.hp,
+          maxHp: squad.hp,
+          damage: squad.damage,
+          attackTimer: squad.attackInterval * 0.5,
+          attackInterval: squad.attackInterval,
           blockingEnemyId: null,
           level: 1,
           type: 'reinforcement',
           alive: true,
           respawnTimer: 0,
-          lifespan: 16,
+          lifespan,
           hitFlash: 0,
         });
         this.spawnParticles(sx, sy, '#60a5fa', 8);
@@ -1511,6 +1807,16 @@ export class Game {
     const inp = this.input.getState();
     if (!this.currentLevel) return;
 
+    // ─── Paused: only pause/Esc are accepted (4) ──────
+    if (this.paused) {
+      if (inp.keysJustPressed.has('escape') ||
+          (inp.justClicked && this.hitRect(inp.clickPos, this.pauseBtn))) {
+        this.paused = false;
+        playSound('button_click');
+      }
+      return;
+    }
+
     // Keyboard hotkeys [1] [2] [Escape]
     if (inp.keysJustPressed.has('1')) {
       if (this.spellCooldowns.rain_of_fire <= 0) {
@@ -1530,6 +1836,16 @@ export class Game {
     if (!inp.justClicked) return;
 
     const click = inp.clickPos;
+
+    // ─── Tutorial skip (f) ────────────────────────────
+    if (this.tutorialStep > 0 && !this.tutorialDismissed) {
+      const skip = this.getTutorialSkipRect();
+      if (skip && this.hitRect(click, skip)) {
+        this.dismissTutorial();
+        playSound('button_click');
+        return;
+      }
+    }
 
     // ─── HUD Buttons ──────────────────────────────────
     // Pause
@@ -1581,10 +1897,10 @@ export class Game {
 
       for (let i = 0; i < itemCount; i++) {
         const itemAngle = (i / itemCount) * Math.PI * 2 - Math.PI / 2;
-        const ix = menu.x + Math.cos(itemAngle) * 50;
-        const iy = menu.y + Math.sin(itemAngle) * 50;
+        const ix = menu.x + Math.cos(itemAngle) * BALANCE.ui.radialItemDistance;
+        const iy = menu.y + Math.sin(itemAngle) * BALANCE.ui.radialItemDistance;
 
-        if (pointInCircle(click, { x: ix, y: iy }, 24)) {
+        if (pointInCircle(click, { x: ix, y: iy }, BALANCE.ui.radialItemRadius)) {
           hit = true;
           const item = menu.items[i];
           if (!item.enabled) break;
@@ -1616,7 +1932,7 @@ export class Game {
 
     // ─── Click on Tower ───────────────────────────────
     for (const tower of this.towers) {
-      if (pointInCircle(click, { x: tower.x, y: tower.y }, 22)) {
+      if (pointInCircle(click, { x: tower.x, y: tower.y }, BALANCE.ui.towerHitRadius)) {
         this.selectedTower = tower;
         this.selectedSlot = -1;
         this.openTowerMenu(tower);
@@ -1627,7 +1943,7 @@ export class Game {
     // ─── Click on Build Slot ──────────────────────────
     for (let i = 0; i < this.currentLevel.buildSlots.length; i++) {
       const slot = this.currentLevel.buildSlots[i];
-      if (pointInCircle(click, slot, 22)) {
+      if (pointInCircle(click, slot, BALANCE.ui.slotHitRadius)) {
         // Check if occupied
         if (this.towers.some(t => t.slotIndex === i)) continue;
         this.selectedSlot = i;
@@ -1850,8 +2166,15 @@ export class Game {
 
     // Decorations (behind path)
     for (const dec of this.decorations) {
-      if (dec.type === 'tree') r.drawTree(dec.x, dec.y, dec.size, level.id);
-      else r.drawRock(dec.x, dec.y, dec.size, level.id);
+      switch (dec.type) {
+        case 'tree': r.drawTree(dec.x, dec.y, dec.size, level.id, dec.variant); break;
+        case 'rock': r.drawRock(dec.x, dec.y, dec.size, level.id, dec.variant); break;
+        case 'bush': r.drawBush(dec.x, dec.y, dec.size, level.id, dec.variant); break;
+        case 'mushroom': r.drawMushroom(dec.x, dec.y, dec.size, level.id); break;
+        case 'stump': r.drawStump(dec.x, dec.y, dec.size, level.id); break;
+        case 'bones': r.drawBones(dec.x, dec.y, dec.size); break;
+        case 'sign': r.drawSign(dec.x, dec.y, dec.size, level.id); break;
+      }
     }
 
     // Path
@@ -1867,7 +2190,7 @@ export class Game {
     for (let i = 0; i < level.buildSlots.length; i++) {
       const slot = level.buildSlots[i];
       const occupied = this.towers.some(t => t.slotIndex === i);
-      const hovered = !occupied && pointInCircle(pointer, slot, 22);
+      const hovered = !occupied && pointInCircle(pointer, slot, BALANCE.ui.slotHitRadius);
       const selected = this.selectedSlot === i;
       r.drawBuildSlot(slot.x, slot.y, occupied, hovered, selected);
     }
@@ -1886,13 +2209,13 @@ export class Game {
     // Soldiers (Barracks & Reinforcements)
     for (const soldier of this.soldiers) {
       if (!soldier.alive) continue;
-      drawSoldierDirect(ctx, soldier, this.menuTime);
+      this.drawInterpolated(soldier, (view) => drawSoldierDirect(ctx, view, this.menuTime));
     }
 
     // Enemies
     for (const enemy of this.enemies) {
       if (!enemy.alive) continue;
-      this.renderEnemy(enemy);
+      this.drawInterpolated(enemy, (view) => this.renderEnemy(view));
     }
 
     // Meteors (Rain of Fire)
@@ -1901,7 +2224,7 @@ export class Game {
     // Projectiles
     for (const proj of this.projectilePool.getActive()) {
       if (!proj.active) continue;
-      this.renderProjectile(proj);
+      this.drawInterpolated(proj, (view) => this.renderProjectile(view));
     }
 
     // Particles
@@ -1949,8 +2272,9 @@ export class Game {
     if (this.paused) {
       ctx.fillStyle = 'rgba(0,0,0,0.5)';
       ctx.fillRect(0, 0, DESIGN_WIDTH, DESIGN_HEIGHT);
-      r.drawTextWithShadow('PAUSED', DESIGN_WIDTH / 2, DESIGN_HEIGHT / 2, '#ffd866', 48, 'center', 'MedievalSharp');
-      r.drawText('Click anywhere to resume', DESIGN_WIDTH / 2, DESIGN_HEIGHT / 2 + 40, 'rgba(255,255,255,0.6)', 16);
+      r.drawTextWithShadow('PAUSED', DESIGN_WIDTH / 2, DESIGN_HEIGHT / 2 - 10, '#ffd866', 48, 'center', 'MedievalSharp');
+      // The match is genuinely frozen now: only the pause button or Esc resumes.
+      r.drawText('Press Esc or click the pause button to resume', DESIGN_WIDTH / 2, DESIGN_HEIGHT / 2 + 40, 'rgba(255,255,255,0.7)', 16);
     }
   }
 
@@ -1959,22 +2283,24 @@ export class Game {
     for (const m of this.meteors) {
       if (!m.active) continue;
 
-      ctx.save();
-      const grad = ctx.createRadialGradient(m.x, m.y, 2, m.x, m.y, 14);
-      grad.addColorStop(0, '#ffffff');
-      grad.addColorStop(0.3, '#ffcc00');
-      grad.addColorStop(0.7, '#ea580c');
-      grad.addColorStop(1, 'rgba(220, 38, 38, 0)');
-      ctx.fillStyle = grad;
-      ctx.beginPath();
-      ctx.arc(m.x, m.y, 14, 0, Math.PI * 2);
-      ctx.fill();
+      this.drawInterpolated(m, (view) => {
+        ctx.save();
+        const grad = ctx.createRadialGradient(view.x, view.y, 2, view.x, view.y, 14);
+        grad.addColorStop(0, '#ffffff');
+        grad.addColorStop(0.3, '#ffcc00');
+        grad.addColorStop(0.7, '#ea580c');
+        grad.addColorStop(1, 'rgba(220, 38, 38, 0)');
+        ctx.fillStyle = grad;
+        ctx.beginPath();
+        ctx.arc(view.x, view.y, 14, 0, Math.PI * 2);
+        ctx.fill();
 
-      ctx.fillStyle = '#451a03';
-      ctx.beginPath();
-      ctx.arc(m.x, m.y, 6, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.restore();
+        ctx.fillStyle = '#451a03';
+        ctx.beginPath();
+        ctx.arc(view.x, view.y, 6, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      });
     }
   }
 
@@ -1987,18 +2313,18 @@ export class Game {
       {
         id: 'rain_of_fire' as const,
         btn: this.spellBtnRain,
-        icon: '🔥',
-        name: 'Rain of Fire',
+        icon: getSpell('rain_of_fire').icon,
+        name: getSpell('rain_of_fire').name,
         hotkey: '1',
-        totalCd: 30,
+        totalCd: getSpell('rain_of_fire').cooldown,
       },
       {
         id: 'reinforcements' as const,
         btn: this.spellBtnReinforce,
-        icon: '🛡',
-        name: 'Reinforce',
+        icon: getSpell('reinforcements').icon,
+        name: getSpell('reinforcements').name,
         hotkey: '2',
-        totalCd: 20,
+        totalCd: getSpell('reinforcements').cooldown,
       },
     ];
 
@@ -2096,7 +2422,9 @@ export class Game {
     const r = this.renderer;
     const pointer = this.input.getState().pointer;
 
-    const radius = this.activeSpell === 'rain_of_fire' ? 65 : 40;
+    const radius = this.activeSpell === 'rain_of_fire'
+      ? (getSpell('rain_of_fire').radius ?? 80)
+      : (getSpell('reinforcements').radius ?? 40);
     const pulse = Math.sin(this.menuTime * 6) * 3;
 
     // Outer targeting circle
@@ -2164,7 +2492,7 @@ export class Game {
       if (hovered) menu.hoveredIndex = i;
 
       // Button circle
-      ctx.fillStyle = !item.enabled ? 'rgba(80,80,80,0.8)' : (hovered ? this.lightenColor(item.color, 0.3) : item.color);
+      ctx.fillStyle = !item.enabled ? 'rgba(80,80,80,0.8)' : (hovered ? lighten(item.color, 0.3) : item.color);
       ctx.beginPath();
       ctx.arc(ix, iy, 22, 0, Math.PI * 2);
       ctx.fill();
@@ -2246,49 +2574,72 @@ export class Game {
 
   // ─── Tutorial ──────────────────────────────────────────────────
 
-  private renderTutorial(): void {
-    const r = this.renderer;
-    const ctx = this.renderer.ctx;
+  /** Where the current tutorial hint points, shared by render and input. */
+  private getTutorialTarget(): { text: string; x: number; y: number } | null {
     let text = '';
     let targetX = DESIGN_WIDTH / 2;
     let targetY = DESIGN_HEIGHT / 2;
 
     switch (this.tutorialStep) {
       case 1:
-        text = '👆 Click a build slot (+) to place a tower!';
+        text = 'Click a build slot (+) to place a tower!';
         if (this.currentLevel && this.currentLevel.buildSlots.length > 0) {
           targetX = this.currentLevel.buildSlots[0].x;
           targetY = this.currentLevel.buildSlots[0].y - 50;
         }
         break;
       case 2:
-        text = '👆 Click your tower to upgrade it!';
+        text = 'Click your tower to upgrade it!';
         if (this.towers.length > 0) {
           targetX = this.towers[0].x;
           targetY = this.towers[0].y - 50;
         }
         break;
       case 3:
-        text = '👆 Click "Call Wave" for bonus gold!';
+        text = 'Click "Call Wave" for bonus gold!';
         targetX = DESIGN_WIDTH / 2;
         targetY = DESIGN_HEIGHT - 100;
         break;
+      default:
+        return null;
     }
 
-    if (text) {
-      // Pulsing highlight
-      const pulse = Math.sin(this.menuTime * 4) * 0.15 + 0.85;
-      r.drawPanel(targetX - 170, targetY - 18, 340, 36, 0.9 * pulse);
-      r.drawText(text, targetX, targetY, '#ffd866', 14, 'center', 'Inter', true);
+    return { text, x: targetX, y: targetY };
+  }
 
-      // Skip button
-      r.drawText('(click to dismiss)', targetX, targetY + 24, 'rgba(255,255,255,0.4)', 10);
+  /** Hit rect of the tutorial's skip control (f). */
+  private getTutorialSkipRect(): { x: number; y: number; w: number; h: number } | null {
+    const target = this.getTutorialTarget();
+    if (!target) return null;
+    return { x: target.x - 58, y: target.y + 20, w: 116, h: 22 };
+  }
 
-      // Check if user clicked the tutorial hint to dismiss
-      const inp = this.input.getState();
-      if (inp.justClicked && pointInCircle(inp.clickPos, { x: targetX, y: targetY }, 180)) {
-        // Don't dismiss if clicking on the actual game element
-      }
+  /** Permanently stop showing the tutorial and remember it. */
+  private dismissTutorial(): void {
+    this.tutorialDismissed = true;
+    this.tutorialStep = 0;
+    this.save.tutorialDismissed = true;
+    writeSave(this.save);
+  }
+
+  private renderTutorial(): void {
+    const r = this.renderer;
+    const target = this.getTutorialTarget();
+    if (!target) return;
+
+    const { text, x: targetX, y: targetY } = target;
+
+    // Pulsing highlight
+    const pulse = Math.sin(this.menuTime * 4) * 0.15 + 0.85;
+    r.drawPanel(targetX - 170, targetY - 18, 340, 36, 0.9 * pulse);
+    r.drawText(text, targetX, targetY, '#ffd866', 14, 'center', 'Inter', true);
+
+    // Skip control — a real button now instead of a dead hint (f).
+    const skip = this.getTutorialSkipRect();
+    if (skip) {
+      const pointer = this.input.getState().pointer;
+      const hovered = this.hitRect(pointer, skip);
+      r.drawButton(skip.x, skip.y, skip.w, skip.h, 'Skip tutorial', hovered);
     }
   }
 
@@ -2344,22 +2695,5 @@ export class Game {
   }
 
   // ─── Color Helpers ─────────────────────────────────────────────
-
-  private darkenColor(hex: string, amount: number): string {
-    return this.adjustColor(hex, -amount);
-  }
-
-  private lightenColor(hex: string, amount: number): string {
-    return this.adjustColor(hex, amount);
-  }
-
-  private adjustColor(hex: string, amount: number): string {
-    let r = parseInt(hex.slice(1, 3), 16);
-    let g = parseInt(hex.slice(3, 5), 16);
-    let b = parseInt(hex.slice(5, 7), 16);
-    r = Math.max(0, Math.min(255, r + Math.round(amount * 255)));
-    g = Math.max(0, Math.min(255, g + Math.round(amount * 255)));
-    b = Math.max(0, Math.min(255, b + Math.round(amount * 255)));
-    return `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`;
-  }
+  // adjustColor/darken/lighten now live in core/color.ts (single source).
 }
