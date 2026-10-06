@@ -4,7 +4,7 @@ export const SPELLS: SpellData[] = [
   {
     id: 'rain_of_fire',
     name: 'Rain of Fire',
-    icon: '🔥',
+    icon: 'spell_rain_of_fire',
     cooldown: 30,
     damage: 80,
     radius: 80,
@@ -15,7 +15,7 @@ export const SPELLS: SpellData[] = [
   {
     id: 'reinforcements',
     name: 'Reinforcements',
-    icon: '🛡',
+    icon: 'spell_reinforcements',
     cooldown: 20,
     duration: 15,
     count: 2,

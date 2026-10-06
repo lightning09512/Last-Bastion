@@ -31,6 +31,14 @@ export function angle(from: Vec2, to: Vec2): number {
   return Math.atan2(to.y - from.y, to.x - from.x);
 }
 
+/** Interpolate between two angles along the shortest arc. */
+export function lerpAngle(from: number, to: number, t: number): number {
+  let delta = (to - from) % (Math.PI * 2);
+  if (delta > Math.PI) delta -= Math.PI * 2;
+  if (delta < -Math.PI) delta += Math.PI * 2;
+  return from + delta * t;
+}
+
 export function clamp(val: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, val));
 }

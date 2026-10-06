@@ -1,0 +1,92 @@
+<!doctype html>
+<!-- TEMPORARY verification harness for MapRenderer (deleted before hand-off).
+     The app bundle cannot build while other agents' renderers are mid-edit,
+     so this page drives MapRenderer.ts directly through the Vite dev server. -->
+<html>
+<body style="margin:0;background:#0a0a12">
+<canvas id="c" width="1280" height="720" style="width:1280px;height:720px;display:block"></canvas>
+<script type="module">
+import { LEVELS } from '/src/data/levels.ts';
+import { BALANCE } from '/src/data/balance.ts';
+import {
+  drawBackgroundDirect, drawPathDirect, drawTreeDirect, drawRockDirect, drawBushDirect,
+  drawMushroomDirect, drawStumpDirect, drawBonesDirect, drawSignDirect,
+  drawSpawnGateDirect, drawBaseDirect,
+} from '/src/rendering/MapRenderer.ts';
+import { sprites } from '/src/rendering/SpriteBank.ts';
+
+const params = new URLSearchParams(location.search);
+const levelId = params.get('level') || 'level_1';
+const level = LEVELS.find((l) => l.id === levelId) || LEVELS[0];
+const ctx = document.getElementById('c').getContext('2d');
+sprites.setSupersample(2);
+
+function makeDecorations() {
+  const dec = BALANCE.decorations;
+  const props = dec.props;
+  const totalWeight = props.reduce((s, p) => s + p.weight, 0);
+  const out = [];
+  for (let i = 0; i < dec.count; i++) {
+    let x = 0; let y = 0; let valid = false; let attempts = 0;
+    do {
+      x = dec.minX + Math.random() * (1280 - dec.minX * 2);
+      y = dec.minY + Math.random() * (720 - dec.minY - 70);
+      valid = true;
+      for (const wp of level.path) if (Math.hypot(x - wp.x, y - wp.y) < dec.pathClearance) { valid = false; break; }
+      if (valid) for (const s of level.buildSlots) if (Math.hypot(x - s.x, y - s.y) < dec.slotClearance) { valid = false; break; }
+      attempts++;
+    } while (!valid && attempts < dec.maxAttempts);
+    if (!valid) continue;
+    let roll = Math.random() * totalWeight; let chosen = props[0];
+    for (const p of props) { roll -= p.weight; if (roll <= 0) { chosen = p; break; } }
+    out.push({
+      x, y, type: chosen.type,
+      size: chosen.sizeMin + Math.random() * (chosen.sizeMax - chosen.sizeMin),
+      variant: chosen.variants > 1 ? Math.floor(Math.random() * chosen.variants) : 0,
+    });
+  }
+  out.sort((a, b) => a.y - b.y);
+  return out;
+}
+
+function drawDecoration(d) {
+  switch (d.type) {
+    case 'tree': drawTreeDirect(ctx, d.x, d.y, d.size, levelId, d.variant); break;
+    case 'rock': drawRockDirect(ctx, d.x, d.y, d.size, levelId, d.variant); break;
+    case 'bush': drawBushDirect(ctx, d.x, d.y, d.size, levelId, d.variant); break;
+    case 'mushroom': drawMushroomDirect(ctx, d.x, d.y, d.size, levelId); break;
+    case 'stump': drawStumpDirect(ctx, d.x, d.y, d.size, levelId); break;
+    case 'bones': drawBonesDirect(ctx, d.x, d.y, d.size); break;
+    case 'sign': drawSignDirect(ctx, d.x, d.y, d.size, levelId); break;
+  }
+}
+
+const decorations = makeDecorations();
+let first = true;
+let frames = 0;
+let acc = 0;
+
+function frame() {
+  const t0 = performance.now();
+  drawBackgroundDirect(ctx, levelId, level.path);
+  drawPathDirect(ctx, level.path, levelId);
+  const items = [
+    { y: level.spawnPosition.y, kind: 'gate', d: null },
+    { y: level.basePosition.y, kind: 'castle', d: null },
+    ...decorations.map((d) => ({ y: d.y, kind: 'dec', d })),
+  ].sort((a, b) => a.y - b.y);
+  for (const it of items) {
+    if (it.kind === 'gate') drawSpawnGateDirect(ctx, level.spawnPosition);
+    else if (it.kind === 'castle') drawBaseDirect(ctx, level.basePosition);
+    else drawDecoration(it.d);
+  }
+  const ms = performance.now() - t0;
+  if (first) { window.__bakeMs = ms; first = false; } else { acc += ms; frames++; }
+  window.__frameMs = frames > 0 ? acc / frames : 0;
+  requestAnimationFrame(frame);
+}
+frame();
+window.__qaErrors = 0;
+</script>
+</body>
+</html>

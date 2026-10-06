@@ -4,7 +4,7 @@ export const TOWERS: Record<string, TowerData> = {
   archer: {
     id: 'archer',
     name: 'Archer Tower',
-    icon: '🏹',
+    icon: 'archer',
     color: '#4CAF50',
     canHitFlying: true,
     targetPriority: 'first',
@@ -73,7 +73,7 @@ export const TOWERS: Record<string, TowerData> = {
   mage: {
     id: 'mage',
     name: 'Mage Tower',
-    icon: '🔮',
+    icon: 'mage',
     color: '#9C27B0',
     canHitFlying: true,
     targetPriority: 'strongest',
@@ -143,7 +143,7 @@ export const TOWERS: Record<string, TowerData> = {
   cannon: {
     id: 'cannon',
     name: 'Cannon Tower',
-    icon: '💣',
+    icon: 'cannon',
     color: '#FF5722',
     canHitFlying: false,
     targetPriority: 'closest',
@@ -217,7 +217,7 @@ export const TOWERS: Record<string, TowerData> = {
   barracks: {
     id: 'barracks',
     name: 'Barracks',
-    icon: '⚔',
+    icon: 'barracks',
     color: '#2196F3',
     canHitFlying: false,
     targetPriority: 'first',

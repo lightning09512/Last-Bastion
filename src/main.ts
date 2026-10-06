@@ -1,5 +1,6 @@
 // ─── Last Bastion - Entry Point ──────────────────────────────────
 import { Game } from './core/game';
+import { postFx } from './core/postfx';
 
 // Wait for DOM and fonts
 window.addEventListener('DOMContentLoaded', () => {
@@ -33,8 +34,12 @@ window.addEventListener('DOMContentLoaded', () => {
           // Start game
           const game = new Game(canvas);
 
-          // QA hooks: ?debug=1 shows the F1 overlay, ?level=<id> skips the menus.
+          // QA hooks: ?debug=1 shows the F1 overlay, ?level=<id> skips the menus,
+          // ?fx=0 disables post-processing (low-end devices / reduced motion).
           const params = new URLSearchParams(window.location.search);
+          if (params.get('fx') === '0') {
+            postFx.settings = { bloom: 0, grade: 0, fog: 0, grain: 0, vignette: 0.6 };
+          }
           const debug = params.get('debug') === '1';
           if (debug) {
             game.enableDebug();

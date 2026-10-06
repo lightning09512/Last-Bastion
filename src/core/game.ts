@@ -12,7 +12,7 @@ import { BALANCE } from '../data/balance';
 import { Renderer } from './renderer';
 import { InputManager } from './input';
 import { ObjectPool } from './pool';
-import { dist, lerp, lerpVec, pointInCircle } from './utils';
+import { dist, lerp, lerpVec, pointInCircle, angle, lerpAngle } from './utils';
 import { loadSave, writeSave } from './save';
 import type { SaveData } from '../data/types';
 import { drawTowerDirect } from '../rendering/TowerRenderer';
@@ -22,6 +22,11 @@ import { getSpell } from '../data/spells';
 import { playSound, playMusic, stopMusic, toggleMute, isMuted, setMuted, initAudio } from './audio';
 import { DebugOverlay } from './debug';
 import { lighten } from './color';
+import { Camera } from './camera';
+import { postFx } from './postfx';
+import { drawIcon, type IconName } from '../rendering/Icons';
+import { vfx } from '../rendering/VFX';
+import { AmbientSystem } from './ambient';
 
 // ─── Runtime Entity Types ────────────────────────────────────────
 
@@ -119,6 +124,8 @@ interface Tower {
   totalInvested: number;
   stunTimer: number;
   animTimer: number; // for attack animation
+  /** A8: current turret facing in radians, eased towards the target. */
+  aimAngle: number;
 }
 
 interface FloatingText {
@@ -144,7 +151,7 @@ interface Particle {
 // ─── Radial Menu ─────────────────────────────────────────────────
 interface RadialMenuItem {
   label: string;
-  icon: string;
+  icon: IconName;
   cost?: number;
   color: string;
   action: string;
@@ -255,6 +262,25 @@ export class Game {
 
   /** A18: frame-time and budget overlay, toggled with F1. */
   private debug = new DebugOverlay();
+
+  /** A12: camera juice (shake / zoom punch) and heavy-hit freeze frames. */
+  private camera = new Camera();
+  private hitStop = 0;
+  /** 1 → 0 red screen flash when the bastion takes damage. */
+  private damageFlash = 0;
+
+  /** A13: the gold counter eases towards the real value instead of jumping. */
+  private displayGold = 0;
+  /** Screen-space shake for HUD feedback (losing a life). */
+  private hudShake = 0;
+  /** Coins that fly from a kill towards the gold counter. */
+  private goldCoins: { sx: number; sy: number; t: number; delay: number }[] = [];
+
+  /** Short-lived death poses so killed units do not vanish instantly. */
+  private corpses: { enemy: Enemy; age: number; maxAge: number }[] = [];
+
+  /** A6: drifting atmosphere per level (pollen, leaves, fireflies, embers). */
+  private ambient = new AmbientSystem();
 
   // Victory/Defeat
   private resultStars = 0;
@@ -612,6 +638,15 @@ export class Game {
     this.nextMeteorId = 1;
     this.simTime = 0;
     this.splashHits.clear();
+    this.corpses.length = 0;
+    vfx.clear();
+    this.ambient.setTheme(level.id);
+    this.goldCoins.length = 0;
+    this.hudShake = 0;
+    this.displayGold = this.gold;
+    this.camera.clear();
+    this.hitStop = 0;
+    this.damageFlash = 0;
     this.gameSpeed = 1;
     this.paused = false;
     this.isFirstLevel = level.id === 'level_1';
@@ -680,8 +715,21 @@ export class Game {
   }
 
   private updateLevel(dt: number): void {
+    // Camera always eases, even while the match is frozen.
+    this.camera.update(dt);
+    if (this.damageFlash > 0) this.damageFlash = Math.max(0, this.damageFlash - dt * 1.6);
+    this.updateHudFeedback(dt);
+
     if (this.paused) {
       // Pause freezes the match: only pause/Esc input is accepted.
+      this.handleLevelInput();
+      return;
+    }
+
+    // A12: hit-stop — heavy impacts freeze the simulation for a few frames
+    // while the renderer keeps drawing, which is what sells the weight.
+    if (this.hitStop > 0) {
+      this.hitStop -= dt;
       this.handleLevelInput();
       return;
     }
@@ -689,6 +737,11 @@ export class Game {
     const effectiveDt = dt * this.gameSpeed;
     this.simTime += effectiveDt;
     this.capturePositions();
+
+    // Corpse timers run on scaled time so game speed still affects them.
+    this.updateCorpses(effectiveDt);
+    vfx.update(effectiveDt);
+    this.ambient.update(effectiveDt);
 
     // Wave management
     this.updateWaves(effectiveDt);
@@ -719,6 +772,88 @@ export class Game {
 
     // Input
     this.handleLevelInput();
+  }
+
+  /** Advance and retire death poses. */
+  /** A13: HUD feedback — gold easing, coin pops and the lives shake. */
+  private updateHudFeedback(dt: number): void {
+    const diff = this.gold - this.displayGold;
+    if (Math.abs(diff) < 0.4) {
+      this.displayGold = this.gold;
+    } else {
+      this.displayGold += diff * Math.min(1, dt * 9);
+    }
+
+    if (this.hudShake > 0) this.hudShake = Math.max(0, this.hudShake - dt * 6);
+
+    for (let i = this.goldCoins.length - 1; i >= 0; i--) {
+      const coin = this.goldCoins[i];
+      if (coin.delay > 0) {
+        coin.delay -= dt;
+        continue;
+      }
+      coin.t += dt * 1.9;
+      if (coin.t >= 1) this.goldCoins.splice(i, 1);
+    }
+  }
+
+  /** Award gold and launch a coin towards the HUD counter. */
+  private addGold(amount: number, fromX?: number, fromY?: number): void {
+    if (amount === 0) return;
+    this.gold += amount;
+    if (fromX !== undefined && fromY !== undefined && this.goldCoins.length < 24) {
+      this.goldCoins.push({ sx: fromX, sy: fromY, t: 0, delay: Math.random() * 0.12 });
+    }
+  }
+
+  private drawGoldCoins(ctx: CanvasRenderingContext2D): void {
+    if (this.goldCoins.length === 0) return;
+    const targetX = 62;
+    const targetY = 25;
+
+    ctx.save();
+    for (const coin of this.goldCoins) {
+      if (coin.delay > 0) continue;
+      const t = coin.t;
+      // Ease-out arc: quick launch, gentle arrival at the counter.
+      const ease = 1 - (1 - t) * (1 - t);
+      const x = coin.sx + (targetX - coin.sx) * ease;
+      const arc = Math.sin(ease * Math.PI) * 46;
+      const y = coin.sy + (targetY - coin.sy) * ease - arc;
+      const scale = 1 - ease * 0.45;
+      const alpha = t < 0.85 ? 1 : (1 - t) / 0.15;
+
+      ctx.globalAlpha = Math.max(0, alpha);
+      const r = 5 * scale;
+      const grad = ctx.createRadialGradient(x - r * 0.35, y - r * 0.35, r * 0.15, x, y, r);
+      grad.addColorStop(0, '#fff6c8');
+      grad.addColorStop(0.55, '#ffd54a');
+      grad.addColorStop(1, '#c98f14');
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(90,58,10,0.65)';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  private updateCorpses(dt: number): void {
+    for (let i = this.corpses.length - 1; i >= 0; i--) {
+      const corpse = this.corpses[i];
+      corpse.age += dt;
+      if (corpse.age >= corpse.maxAge) this.corpses.splice(i, 1);
+    }
+  }
+
+  /** Remember a fallen unit so it can fade out instead of popping away. */
+  private addCorpse(enemy: Enemy): void {
+    if (enemy.flying) return;
+    if (this.corpses.length >= 40) this.corpses.shift();
+    this.corpses.push({ enemy: { ...enemy, alive: true }, age: 0, maxAge: 0.55 });
   }
 
   /**
@@ -829,7 +964,7 @@ export class Game {
   private callWaveEarly(): void {
     if (!this.waitingForWave || this.allWavesComplete) return;
     const bonus = this.waves[this.currentWaveIndex]?.earlyCallBonus || 0;
-    this.gold += bonus;
+    this.addGold(bonus, DESIGN_WIDTH / 2, DESIGN_HEIGHT - 80);
     playSound('wave_horn');
     playSound('gold_gain');
     this.spawnFloatingText(DESIGN_WIDTH / 2, DESIGN_HEIGHT - 80, `+${bonus} gold!`, '#ffd700', 20);
@@ -875,6 +1010,9 @@ export class Game {
     };
 
     this.enemies.push(enemy);
+
+    // Spawn feedback: dust where the unit steps onto the path.
+    vfx.spawn('spawnPuff', spawn.x, spawn.y, { color: data.color, scale: 0.8 });
   }
 
   private updateEnemies(dt: number): void {
@@ -935,7 +1073,8 @@ export class Game {
             if (ally.alive && !ally.flying && dist(enemy, ally) <= heal.range && ally.hp < ally.maxHp) {
               ally.hp = Math.min(ally.maxHp, ally.hp + heal.amount);
               this.spawnFloatingText(ally.x, ally.y - 10, `+${heal.amount}`, '#22c55e', 13);
-              this.spawnParticles(ally.x, ally.y, '#22c55e', 4);
+              vfx.spawn('healGlow', ally.x, ally.y);
+              this.spawnParticles(ally.x, ally.y, '#22c55e', 2);
             }
           }
         }
@@ -963,6 +1102,7 @@ export class Game {
         if (enemy.stunTimer >= stun.interval) {
           enemy.stunTimer = 0;
           playSound('warlord_roar');
+          this.camera.shake(6, 0.35);
           this.spawnFloatingText(enemy.x, enemy.y - 25, 'WAR CRY!', '#ef4444', 16);
           for (const tower of this.towers) {
             if (dist(enemy, tower) <= stun.range) {
@@ -1068,6 +1208,10 @@ export class Game {
     this.lives -= enemy.livesDamage;
     this.livesLost += enemy.livesDamage;
     if (this.lives < 0) this.lives = 0;
+    this.camera.shake(6, 0.3);
+    this.damageFlash = Math.min(1, this.damageFlash + 0.7);
+    this.hudShake = 1;
+    vfx.spawn('explosion', enemy.x, enemy.y, { scale: 1.1, color: '#ff5a3c' });
 
     // Flash effect at base
     if (this.currentLevel) {
@@ -1092,9 +1236,13 @@ export class Game {
 
     if (enemy.hp <= 0) {
       enemy.alive = false;
-      this.gold += enemy.goldReward;
+      this.addGold(enemy.goldReward, enemy.x, enemy.y - 10);
       playSound('enemy_death');
       playSound('gold_gain');
+      this.addCorpse(enemy);
+      this.camera.shake(Math.min(4, 1 + enemy.size * 0.12), 0.2);
+      vfx.spawn('dust', enemy.x, enemy.y, { scale: Math.max(0.6, enemy.size / 9) });
+      if (enemy.size >= 12) vfx.spawn('debris', enemy.x, enemy.y, { color: enemy.color });
       this.spawnFloatingText(enemy.x, enemy.y - 15, `+${enemy.goldReward}`, '#ffd700', 14);
       this.spawnParticles(enemy.x, enemy.y, enemy.color, 8);
 
@@ -1137,12 +1285,15 @@ export class Game {
       totalInvested: cost,
       stunTimer: 0,
       animTimer: 0,
+      aimAngle: -Math.PI / 2,
     };
 
     this.towers.push(tower);
     this.radialMenu = null;
     this.selectedSlot = -1;
-    this.spawnParticles(slot.x, slot.y, towerData.color, 10);
+    vfx.spawn('dust', slot.x, slot.y, { scale: 1.2 });
+    vfx.spawn('spawnPuff', slot.x, slot.y - 12, { color: towerData.color });
+    this.spawnParticles(slot.x, slot.y, towerData.color, 6);
     playSound('upgrade');
 
     // Tutorial: built first tower
@@ -1162,7 +1313,9 @@ export class Game {
     this.gold -= nextLevel.cost;
     tower.totalInvested += nextLevel.cost;
     tower.level++;
-    this.spawnParticles(tower.x, tower.y, towerData.color, 8);
+    vfx.spawn('shockwave', tower.x, tower.y - 10, { color: towerData.color });
+    vfx.spawn('dust', tower.x, tower.y, { scale: 1.1 });
+    this.spawnParticles(tower.x, tower.y, towerData.color, 6);
     playSound('upgrade');
     this.radialMenu = null;
     this.selectedTower = null;
@@ -1184,6 +1337,8 @@ export class Game {
     this.gold -= spec.cost;
     tower.totalInvested += spec.cost;
     tower.specId = spec.specId;
+    vfx.spawn('holySmite', tower.x, tower.y - 16, { color: towerData.color });
+    vfx.spawn('shockwave', tower.x, tower.y - 8, { color: towerData.color });
     this.spawnParticles(tower.x, tower.y, towerData.color, 12);
     playSound('upgrade');
     this.radialMenu = null;
@@ -1192,7 +1347,9 @@ export class Game {
 
   private sellTower(tower: Tower): void {
     const refund = Math.floor(tower.totalInvested * SELL_REFUND_RATE);
-    this.gold += refund;
+    this.addGold(refund, tower.x, tower.y - 20);
+    vfx.spawn('smokePuff', tower.x, tower.y - 12, { scale: 1.3 });
+    vfx.spawn('debris', tower.x, tower.y, { color: TOWERS[tower.dataId].color });
     playSound('gold_gain');
     this.spawnFloatingText(tower.x, tower.y - 20, `+${refund}`, '#ffd700', 16);
 
@@ -1234,6 +1391,9 @@ export class Game {
         // Find target
         const target = this.findTarget(tower, stats.range, towerData.targetPriority, towerData.canHitFlying);
         if (target) {
+          // A8: ease the turret towards what it is shooting at.
+          const desired = angle({ x: tower.x, y: tower.y - 10 }, { x: target.x, y: target.y });
+          tower.aimAngle = lerpAngle(tower.aimAngle, desired, Math.min(1, dt * BALANCE.tower.aimTurnSpeed));
           this.fireTower(tower, target, stats);
           tower.fireTimer = 1 / stats.fireRate;
           tower.animTimer = BALANCE.tower.attackAnimDuration;
@@ -1357,13 +1517,17 @@ export class Game {
 
         if (proj.splashRadius > 0) {
           playSound('cannon_hit');
+          this.camera.shake(3, 0.18);
+          vfx.spawn('explosion', impactX, impactY, { scale: proj.splashRadius / 45 });
           this.applySplashDamage(`proj:${proj.id}`, impactX, impactY, proj.splashRadius, proj.damage, proj.damageType);
-          this.spawnParticles(impactX, impactY, '#ff6600', 6);
+          this.spawnParticles(impactX, impactY, '#ff6600', 3);
         } else if (target) {
           if (proj.damageType === 'magic') {
             playSound('magic_hit');
+            vfx.spawn('magicImpact', impactX, impactY, { color: proj.color });
           } else {
             playSound('arrow_hit');
+            vfx.spawn('arrowImpact', impactX, impactY, { color: proj.color });
           }
           this.damageEnemy(target, proj.damage, proj.damageType);
         } else {
@@ -1700,8 +1864,12 @@ export class Game {
         m.active = false;
         // Impact!
         playSound('meteor_impact');
-        this.spawnParticles(m.targetX, m.targetY, '#ea580c', 16);
-        this.spawnParticles(m.targetX, m.targetY, '#facc15', 10);
+        this.camera.shake(9, 0.45);
+        this.hitStop = 0.07;
+        vfx.spawn('explosion', m.targetX, m.targetY, { scale: Math.max(1.4, m.radius / 45) });
+        vfx.spawn('shockwave', m.targetX, m.targetY, { scale: m.radius / 48 });
+        this.spawnParticles(m.targetX, m.targetY, '#ea580c', 8);
+        this.spawnParticles(m.targetX, m.targetY, '#facc15', 5);
         this.applySplashDamage(`meteor:${m.id}`, m.targetX, m.targetY, m.radius, m.damage, 'physical');
         this.meteors.splice(i, 1);
       }
@@ -1780,6 +1948,7 @@ export class Game {
           hitFlash: 0,
         });
         this.spawnParticles(sx, sy, '#60a5fa', 8);
+        vfx.spawn('spawnPuff', sx, sy, { color: '#60a5fa' });
       }
       this.spawnFloatingText(x, y - 25, 'REINFORCEMENTS!', '#38bdf8', 14);
     }
@@ -1820,6 +1989,7 @@ export class Game {
       }
 
       this.screen = 'victory';
+      this.camera.punch(1.05, 2.2);
       playSound('victory');
       stopMusic();
     }
@@ -1989,7 +2159,7 @@ export class Game {
     const items: RadialMenuItem[] = [
       {
         label: 'Archer',
-        icon: TOWERS.archer.icon,
+        icon: TOWERS.archer.icon as IconName,
         cost: TOWERS.archer.levels[0].cost,
         color: TOWERS.archer.color,
         action: 'archer',
@@ -1998,7 +2168,7 @@ export class Game {
       },
       {
         label: 'Mage',
-        icon: TOWERS.mage.icon,
+        icon: TOWERS.mage.icon as IconName,
         cost: TOWERS.mage.levels[0].cost,
         color: TOWERS.mage.color,
         action: 'mage',
@@ -2007,7 +2177,7 @@ export class Game {
       },
       {
         label: 'Cannon',
-        icon: TOWERS.cannon.icon,
+        icon: TOWERS.cannon.icon as IconName,
         cost: TOWERS.cannon.levels[0].cost,
         color: TOWERS.cannon.color,
         action: 'cannon',
@@ -2016,7 +2186,7 @@ export class Game {
       },
       {
         label: 'Barracks',
-        icon: TOWERS.barracks.icon,
+        icon: TOWERS.barracks.icon as IconName,
         cost: TOWERS.barracks.levels[0].cost,
         color: TOWERS.barracks.color,
         action: 'barracks',
@@ -2043,7 +2213,7 @@ export class Game {
       const refund = Math.floor(tower.totalInvested * SELL_REFUND_RATE);
       items.push({
         label: `Sell (${refund})`,
-        icon: '💰',
+        icon: 'sell',
         color: '#e74c3c',
         action: 'sell',
         enabled: true,
@@ -2053,7 +2223,7 @@ export class Game {
       const nextCost = towerData.levels[tower.level + 1].cost;
       items.push({
         label: `Upgrade (${nextCost})`,
-        icon: '⬆',
+        icon: 'upgrade',
         cost: nextCost,
         color: '#27ae60',
         action: 'upgrade',
@@ -2064,18 +2234,18 @@ export class Game {
       const refund = Math.floor(tower.totalInvested * SELL_REFUND_RATE);
       items.push({
         label: `Sell (${refund})`,
-        icon: '💰',
+        icon: 'sell',
         color: '#e74c3c',
         action: 'sell',
         enabled: true,
       });
     } else {
-      // Level 3 - offer specializations
+      // Level 3 - offer specializations, each with its own icon
       for (let i = 0; i < 2; i++) {
         const spec = towerData.specializations[i];
         items.push({
           label: spec.specName,
-          icon: i === 0 ? '⭐' : '🌟',
+          icon: `spec_${spec.specId}` as IconName,
           cost: spec.cost,
           color: towerData.color,
           action: `spec_${i}`,
@@ -2087,7 +2257,7 @@ export class Game {
       const refund = Math.floor(tower.totalInvested * SELL_REFUND_RATE);
       items.push({
         label: `Sell (${refund})`,
-        icon: '💰',
+        icon: 'sell',
         color: '#e74c3c',
         action: 'sell',
         enabled: true,
@@ -2185,11 +2355,17 @@ export class Game {
     const level = this.currentLevel;
     const pointer = this.input.getState().pointer;
 
+    // A12: camera juice wraps only the world; the HUD stays pinned.
+    this.camera.apply(ctx, DESIGN_WIDTH / 2, DESIGN_HEIGHT / 2);
+
     // Background
     r.drawBackground(level.id, level.path);
 
     // Path (flat ground layer)
     r.drawPath(level.path, level.id);
+
+    // A6: atmosphere drifts behind everything that stands on the ground.
+    this.ambient.draw(ctx);
 
     // Build slots are ground decals: they always sit under the sorted pass.
     for (let i = 0; i < level.buildSlots.length; i++) {
@@ -2220,6 +2396,16 @@ export class Game {
       if (enemy.alive) n = this.addWorldItem(n, enemy.y, WorldKind.Enemy, enemy);
     }
     this.sortWorldItems(n);
+
+    // Death poses lie flat on the ground, under everything still standing.
+    for (const corpse of this.corpses) {
+      const t = corpse.age / corpse.maxAge;
+      ctx.save();
+      ctx.globalAlpha = Math.max(0, 1 - t * t);
+      corpse.enemy.y += t * 5;
+      this.renderEnemy(corpse.enemy);
+      ctx.restore();
+    }
 
     for (let i = 0; i < n; i++) {
       const item = this.worldItems[this.worldOrder[i]];
@@ -2275,13 +2461,26 @@ export class Game {
     }
     ctx.globalAlpha = 1;
 
+    // A11: the VFX library paints impacts, explosions, smoke and decals.
+    vfx.draw(ctx);
+
+    // World drawing is done: drop the camera before any UI element.
+    this.camera.reset(ctx);
+
     // Radial menu
     if (this.radialMenu) {
       this.renderRadialMenu();
     }
 
-    // Vignette
-    r.drawVignette();
+    postFx.apply(ctx, this.renderer.canvas, level.id, this.menuTime);
+
+    // Red flash when the bastion is hit.
+    if (this.damageFlash > 0) {
+      ctx.save();
+      ctx.fillStyle = `rgba(190,26,32,${(this.damageFlash * 0.30).toFixed(3)})`;
+      ctx.fillRect(0, 0, DESIGN_WIDTH, DESIGN_HEIGHT);
+      ctx.restore();
+    }
 
     // HUD
     this.renderHUD();
@@ -2289,6 +2488,9 @@ export class Game {
     // Spells HUD & Targeting
     this.renderSpellsHUD();
     this.renderSpellTargeting();
+
+    // A13: hover information, drawn above the HUD.
+    this.renderTooltips();
 
     // Tutorial
     if (this.tutorialStep > 0 && !this.tutorialDismissed) {
@@ -2303,6 +2505,106 @@ export class Game {
       // The match is genuinely frozen now: only the pause button or Esc resumes.
       r.drawText('Press Esc or click the pause button to resume', DESIGN_WIDTH / 2, DESIGN_HEIGHT / 2 + 40, 'rgba(255,255,255,0.7)', 16);
     }
+  }
+
+  // ─── Hover tooltips (A13) ──────────────────────────────────────
+
+  /** Enemy under a point, using a radius that scales with the unit. */
+  private enemyAt(p: Vec2): Enemy | null {
+    let best: Enemy | null = null;
+    let bestDist = Infinity;
+    for (const enemy of this.enemies) {
+      if (!enemy.alive) continue;
+      const r = Math.max(16, enemy.size * 1.8);
+      const d = dist(p, enemy);
+      if (d <= r && d < bestDist) {
+        bestDist = d;
+        best = enemy;
+      }
+    }
+    return best;
+  }
+
+  /** Effective damage per second of a tower, straight from its data. */
+  private towerDps(tower: Tower): number {
+    const stats = this.getTowerStats(tower);
+    if (tower.dataId === 'barracks') {
+      const squad = stats.soldier ?? BALANCE.soldier.fallback;
+      return (squad.damage / Math.max(0.01, squad.attackInterval)) * BALANCE.soldier.count;
+    }
+    const shots = tower.specId === 'rapid_volley' ? 3 : 1;
+    return stats.damage * stats.fireRate * shots;
+  }
+
+  private renderTooltips(): void {
+    const pointer = this.input.getState().pointer;
+
+    const hoveredEnemy = this.enemyAt(pointer);
+    if (hoveredEnemy) {
+      const r = Math.max(18, hoveredEnemy.size * 1.8);
+      const ctx = this.renderer.ctx;
+      ctx.save();
+      ctx.strokeStyle = 'rgba(255,236,170,0.85)';
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([4, 3]);
+      ctx.beginPath();
+      ctx.arc(hoveredEnemy.x, hoveredEnemy.y, r, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+
+      this.drawTooltip(pointer, ENEMIES[hoveredEnemy.dataId]?.name ?? hoveredEnemy.dataId, [
+        `HP ${Math.ceil(hoveredEnemy.hp)} / ${hoveredEnemy.maxHp}`,
+        `Armor ${Math.round(hoveredEnemy.armor * 100)}%  ·  Resist ${Math.round(hoveredEnemy.magicResist * 100)}%`,
+        `Speed ${hoveredEnemy.speed}  ·  ${hoveredEnemy.flying ? 'Flying' : 'Ground'}`,
+        `Lives -${hoveredEnemy.livesDamage}  ·  Bounty ${hoveredEnemy.goldReward}g`,
+      ]);
+      return;
+    }
+
+    const hoveredTower = this.towers.find(
+      (t) => pointInCircle(pointer, { x: t.x, y: t.y }, BALANCE.ui.towerHitRadius),
+    );
+    if (hoveredTower) {
+      const data = TOWERS[hoveredTower.dataId];
+      const stats = this.getTowerStats(hoveredTower);
+      const spec = hoveredTower.specId
+        ? data.specializations.find((s) => s.specId === hoveredTower.specId)
+        : null;
+      this.drawTooltip(pointer, spec ? spec.specName : stats.name, [
+        `DPS ${this.towerDps(hoveredTower).toFixed(1)}  ·  Range ${Math.round(stats.range)}`,
+        `${stats.damageType === 'magic' ? 'Magic' : 'Physical'} damage` +
+          (stats.splashRadius ? `  ·  Splash ${Math.round(stats.splashRadius)}` : ''),
+        `Invested ${hoveredTower.totalInvested}g  ·  Sell ${Math.floor(hoveredTower.totalInvested * SELL_REFUND_RATE)}g`,
+        hoveredTower.stunTimer > 0 ? 'STUNNED' : `Priority: ${data.targetPriority}`,
+      ]);
+    }
+  }
+
+  private drawTooltip(pointer: Vec2, title: string, lines: string[]): void {
+    const r = this.renderer;
+    const ctx = this.renderer.ctx;
+    const width = 232;
+    const height = 26 + lines.length * 15 + 8;
+
+    // Flip the panel so it never leaves the play area.
+    let x = pointer.x + 18;
+    let y = pointer.y + 18;
+    if (x + width > DESIGN_WIDTH - 8) x = pointer.x - width - 18;
+    if (y + height > DESIGN_HEIGHT - 8) y = pointer.y - height - 18;
+    x = Math.max(8, Math.min(x, DESIGN_WIDTH - width - 8));
+    y = Math.max(8, Math.min(y, DESIGN_HEIGHT - height - 8));
+
+    ctx.save();
+    r.drawPanel(x, y, width, height, 0.94);
+    ctx.strokeStyle = 'rgba(240,200,110,0.55)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x + 1.5, y + 1.5, width - 3, height - 3);
+
+    r.drawText(title, x + 10, y + 15, '#ffd866', 13, 'left', 'MedievalSharp', true);
+    lines.forEach((line, i) => {
+      r.drawText(line, x + 10, y + 32 + i * 15, 'rgba(240,232,214,0.92)', 12, 'left', 'Inter');
+    });
+    ctx.restore();
   }
 
   // ─── Depth-sorted world pass (A3) ──────────────────────────────
@@ -2442,11 +2744,8 @@ export class Game {
         ctx.stroke();
       }
 
-      // Spell icon
-      ctx.font = '24px Inter, sans-serif';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(s.icon, cx, cy + 1);
+      // Spell icon (vector, A15)
+      drawIcon(ctx, s.icon as IconName, cx, cy + 1, 26, isReady ? 1 : 0.55);
 
       // Cooldown sweep overlay
       if (!isReady) {
@@ -2504,8 +2803,12 @@ export class Game {
     ctx.lineTo(pointer.x, pointer.y + radius);
     ctx.stroke();
 
+    // Vector icon instead of an emoji prefix (A15).
+    const icon: IconName = this.activeSpell === 'rain_of_fire' ? 'spell_rain_of_fire' : 'spell_reinforcements';
+    drawIcon(ctx, icon, pointer.x, pointer.y - radius - 22, 24);
+
     r.drawTextWithShadow(
-      this.activeSpell === 'rain_of_fire' ? '🔥 Click to Rain Fire!' : '🛡 Click to Deploy Soldiers!',
+      this.activeSpell === 'rain_of_fire' ? 'Click to Rain Fire!' : 'Click to Deploy Soldiers!',
       pointer.x,
       pointer.y - radius - 15,
       '#ffd700',
@@ -2566,12 +2869,8 @@ export class Game {
       ctx.arc(ix, iy, 22, 0, Math.PI * 2);
       ctx.stroke();
 
-      // Icon
-      ctx.font = '16px Inter';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillStyle = '#fff';
-      ctx.fillText(item.icon, ix, iy - 2);
+      // Icon (vector, A15)
+      drawIcon(ctx, item.icon, ix, iy - 3, 22, item.enabled ? 1 : 0.55);
 
       // Cost label
       if (item.cost !== undefined) {
@@ -2618,8 +2917,18 @@ export class Game {
       ? (this.waves[this.currentWaveIndex].earlyCallBonus || 15)
       : 0;
 
+    const ctx = this.renderer.ctx;
+
+    // A13: the counter eases towards the real value, and a lost life makes
+    // the whole HUD jolt.
+    ctx.save();
+    if (this.hudShake > 0.01) {
+      const amp = this.hudShake * 5;
+      ctx.translate((Math.random() - 0.5) * amp, (Math.random() - 0.5) * amp);
+    }
+
     this.renderer.drawTopHUD(
-      this.gold,
+      Math.round(this.displayGold),
       this.lives,
       this.maxLives,
       this.currentWaveIndex,
@@ -2632,6 +2941,11 @@ export class Game {
       pointer,
       this.menuTime
     );
+
+    ctx.restore();
+
+    // Coins fly in screen space, on top of the bar.
+    this.drawGoldCoins(ctx);
   }
 
   // ─── Tutorial ──────────────────────────────────────────────────

@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>VFX gallery (temporary test page)</title>
+<style>
+  html, body { margin: 0; background: #101418; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1280" height="720"></canvas>
+<script type="module">
+import { VfxSystem, vfx as singleton } from '/src/rendering/VFX.ts';
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const local = new VfxSystem(600);
+const vfx = singleton;
+
+const KINDS = [
+  'explosion', 'frostBurst', 'fireLick', 'lightning', 'holySmite', 'poisonCloud',
+  'dust', 'debris', 'shockwave', 'smokePuff', 'coinPop', 'healGlow',
+  'shieldBreak', 'stunStars', 'arrowImpact', 'magicImpact', 'bloodSpray', 'spawnPuff',
+];
+
+// 0 = gallery, 1 = gallery over moving ground, 2 = stress/cap test.
+let scenario = 0;
+let elapsed = 0;
+let frames = 0;
+let fpsClock = 0;
+let frozen = false;
+
+const params = new URLSearchParams(location.search);
+if (params.get('freeze') === '1') frozen = true;
+
+function ground() {
+  ctx.fillStyle = scenario === 1 ? '#4a4536' : '#39412c';
+  ctx.fillRect(0, 0, 1280, 720);
+  // Terrain texture so sprite readability can be judged against clutter.
+  for (let i = 0; i < 90; i++) {
+    const x = ((i * 137) % 1280);
+    const y = ((i * 311) % 720);
+    ctx.globalAlpha = 0.16;
+    ctx.fillStyle = i % 3 === 0 ? '#6d7a4a' : (i % 3 === 1 ? '#2b3222' : '#57603a');
+    ctx.beginPath();
+    ctx.ellipse(x, y, 22 + (i % 5) * 9, 12 + (i % 4) * 6, i, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function label(x, y, w, h) {
+  // Placeholder marker box (no text glyphs on purpose).
+  ctx.fillStyle = 'rgba(0,0,0,0.35)';
+  ctx.fillRect(x - w / 2, y - h / 2, w, h);
+}
+
+function setupGallery() {
+  const cols = 6;
+  for (let i = 0; i < KINDS.length; i++) {
+    const cx = 120 + (i % cols) * 212;
+    const cy = 150 + Math.floor(i / cols) * 210;
+    label(cx, cy, 118, 44);
+    local.spawn(KINDS[i], cx + 6, cy + 4, { scale: 1.25 });
+    if (KINDS[i] === 'stunStars') {
+      for (let s = 0; s < 3; s++) local.spawn('stunStars', cx + 6, cy + 4, { scale: 1.25 });
+    }
+  }
+}
+
+function setupStress() {
+  for (let i = 0; i < 42; i++) {
+    const x = 70 + Math.random() * 1140;
+    const y = 90 + Math.random() * 540;
+    local.spawn('explosion', x, y, { scale: 0.7 + Math.random() * 0.9 });
+  }
+  for (let i = 0; i < 10; i++) {
+    local.spawn('lightning', 80 + i * 130, 300 + (i % 3) * 90, { scale: 1 });
+  }
+  for (let i = 0; i < 16; i++) {
+    local.spawn('coinPop', 90 + i * 76, 620, { scale: 1 });
+  }
+}
+
+const phases = [setupGallery, setupGallery, setupStress];
+const durations = [5, 5, 5];
+
+let phase = 0;
+elapsed = 0;
+let last = performance.now();
+phases[0]();
+window.__vfxScenario = 0;
+
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000 || 0.016);
+  last = now;
+  if (frozen) {
+    requestAnimationFrame(frame);
+    return;
+  }
+  elapsed += dt;
+  frames++;
+  fpsClock += dt;
+  if (fpsClock >= 0.5) {
+    frames = 0;
+    fpsClock = 0;
+  }
+
+  if (elapsed >= durations[phase]) {
+    phase = (phase + 1) % phases.length;
+    scenario = phase;
+    elapsed = 0;
+    local.clear();
+    phases[phase]();
+    window.__vfxScenario = phase;
+  }
+
+  local.update(dt);
+  ground();
+  local.draw(ctx);
+  drawHud();
+  requestAnimationFrame(frame);
+}
+
+function drawHud() {
+  ctx.save();
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = 'rgba(0,0,0,0.62)';
+  ctx.fillRect(24, 24, 260, 30);
+  // Scenario tick marks: 1, 2 or 3 bars for scenario 0, 1, 2.
+  ctx.fillStyle = '#8ef58e';
+  for (let i = 0; i <= scenario; i++) ctx.fillRect(38 + i * 16, 34, 10, 12);
+  ctx.beginPath();
+  const active = local.activeCount;
+  ctx.fillStyle = active > 599 ? '#ff6b6b' : '#8ef58e';
+  ctx.fillRect(24, 660, Math.min(600, active), 14);
+  ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(24.5, 660.5, 480, 14);
+  ctx.restore();
+}
+
+requestAnimationFrame(frame);
+
+// Probe-friendly hooks.
+window.__vfxLocal = local;
+window.__vfxActive = () => local.activeCount;
+window.__vfxOverwritten = () => local.overwritten;
+window.__vfxScenario = 0;
+window.__vfxKinds = KINDS;
+
+/**
+ * Freeze the built-in loop, run `steps` fixed 1/60 s updates, then draw on the
+ * NEXT animation frame. Drawing inside rAF matters: a canvas painted from a
+ * synchronous script moves no compositor frame, so a screenshot taken right
+ * afterwards would still show the previous (blank) surface.
+ */
+window.__vfxStage = (steps) => {
+  frozen = true;
+  const n = Math.max(1, steps | 0);
+  for (let i = 0; i < n; i++) vfx.update(1 / 60);
+  const painted = vfx.activeCount;
+  requestAnimationFrame(() => {
+    ground();
+    vfx.draw(ctx);
+    window.__vfxPainted = true;
+  });
+  return painted;
+};
+
+window.__vfxSpawn = (kind, x, y, scale) => {
+  vfx.spawn(kind, x, y, { scale: scale || 1 });
+};
+window.__vfxClear = () => { vfx.clear(); };
+
+</script>
+</body>
+</html>

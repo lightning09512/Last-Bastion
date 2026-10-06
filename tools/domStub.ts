@@ -14,6 +14,11 @@ function makeCtx(canvas: unknown) {
     createPattern: () => null,
     measureText: () => ({ width: 10 }),
     getImageData: () => ({ data: new Uint8ClampedArray(4), width: 1, height: 1 }),
+    createImageData: (w: number, h: number) => ({
+      data: new Uint8ClampedArray(Math.max(1, w * h * 4)),
+      width: w,
+      height: h,
+    }),
     putImageData() {},
     save() {}, restore() {},
     beginPath() {}, closePath() {},
@@ -58,6 +63,21 @@ export function makeCanvas(): unknown {
   return canvas;
 }
 
+/** Minimal Path2D: path building only, the stub context swallows drawing. */
+class Path2DStub {
+  moveTo(): void {}
+  lineTo(): void {}
+  arc(): void {}
+  arcTo(): void {}
+  ellipse(): void {}
+  rect(): void {}
+  roundRect(): void {}
+  quadraticCurveTo(): void {}
+  bezierCurveTo(): void {}
+  closePath(): void {}
+  addPath(): void {}
+}
+
 export function installDomStub(): void {
   const store = new Map<string, string>();
 
@@ -87,6 +107,7 @@ export function installDomStub(): void {
   globals.requestAnimationFrame = () => 0;
   globals.cancelAnimationFrame = () => {};
   globals.devicePixelRatio = 1;
+  globals.Path2D = Path2DStub;
 }
 
 installDomStub();

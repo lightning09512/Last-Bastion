@@ -49,24 +49,26 @@ Quy tắc: mỗi task có DoD rõ ràng; `npm run build` phải pass sau mỗi n
 
 **Điều kiện ra Phase 0:** ✅ đã đạt (build pass, hình không méo ở 3 tỷ lệ, pause chặn xây/bán/cast, `game.ts` không còn literal balance, 7 bug đã sửa và có test).
 
-## Phase 1 — Đồ họa lõi
+## Phase 1 — Đồ họa lõi (đang thực hiện)
 
-| Task | Nội dung | Phụ thuộc |
-|---|---|---|
-| A2 | `SpriteBank` + cache LRU, chuyển enemy/tower/slot sang `drawImage` | A0 |
-| A3 | Y-sorting theo `y + elevation` | A2 |
-| A4 | `Lighting.ts`: contact shadow + cast shadow + rim light thống nhất | A2 |
-| A5 | Terrain đa lớp, biome, decal, hết banding, dùng `flowerColors`/`waterColor`/`fogColor`; gate/castle nhận theme | A3 |
-| A6 | Props sống + ambient particle theo theme | A5 |
-| A8 | Tower state machine `idle/aim/fire/recoil/build/upgrade/damaged`, turret xoay, muzzle flash | A2 |
-| A9 | Enemy walk/attack/hit/death/spawn animation + biến thể elite | A2 |
-| A10 | Projectile xoay/trail/parabol/cluster + decal mũi tên | A2 |
-| A11 | `VFX.ts` + screen shake + hit-stop | A2 |
-| A13 | HUD juice: vàng tween, coin bay, so sánh chỉ số, tooltip | A2 |
-| A15 | `Icons.ts` thay toàn bộ emoji/ký tự text | A2 |
-| A17 | Loading bake thật + loader atlas | A2 |
+| Task | Nội dung | Phụ thuộc | Trạng thái |
+|---|---|---|---|
+| A2 | `SpriteBank` (bake supersampled ×2–3 + LRU 300) + thống kê trên overlay F1 | A0 | ✅ hạ tầng xong; các renderer đang chuyển sang dùng |
+| A3 | Y-sorting theo `y` cho prop/tower/lính/enemy/castle/gate, không cấp phát mỗi frame | A2 | ✅ |
+| A4 | `Lighting.ts`: contact shadow, cast shadow theo `elevation`, ground AO, rim light, outline, body gradient | A2 | ✅ |
+| A12 | `postfx.ts`: bloom (downsample + bright-pass + additive), fog, color grade, vignette, grain (tắt mặc định); camera shake/zoom punch/hit-stop (`camera.ts`) | A3 | ✅ |
+| A13 | HUD juice: số vàng tween, coin bay về HUD, HUD rung khi mất mạng, red flash, tooltip hover cho enemy/tower | A12 | ✅ phần core |
+| A5 | Terrain/path/props/gate/castle chi tiết + hết banding + 7 loại prop có biến thể | A3, A4 | ⏳ agent art |
+| A8 | Tower 4×3×2 với outline/shading/silhouette + animation bắn/choáng/idle | A2, A4 | ⏳ agent art |
+| A9 | Enemy walk/attack/hit/frost + thanh máu + outline; **death pose đã có ở core** (`corpses`) | A2, A4 | ⏳ agent art |
+| A10 | Projectile xoay theo hướng, trail, đầu đạn chi tiết | A2 | ⏳ agent art |
+| A11 | `VFX.ts` (explosion, frost, fire, shockwave, smoke, decal, coinPop…) + screen shake đã nối | A2 | ⏳ agent art (API) → core wire |
+| A15 | `Icons.ts` thay toàn bộ emoji/glyph text; UI 9-slice + 4 trạng thái nút | A2 | ⏳ agent art (API) → core wire |
+| A17 | Loading bake thật + `loadAtlas` cho art vẽ tay sau này | A2 | ⏳ |
 
-**Điều kiện ra Phase 1:** 60fps với ≥80 enemy; 0 emoji; có số liệu trước/sau.
+Hook mới: `?fx=0` tắt post-processing (máy yếu / reduced motion).
+
+**Điều kiện ra Phase 1:** 60fps với ≥80 enemy; 0 emoji; có số liệu trước/sau (đã có bộ đo: overlay F1 + `tools/browserCheck.mjs`).
 
 ## Phase 2 — Chiều sâu gameplay
 
